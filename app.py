@@ -318,7 +318,6 @@ LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
 <title>MR X Bot Hosting — Dashboard</title>""" + CSS + """</head><body>
 <header><div class="logo">MR X BOT HOSTING</div><a href="{{ url_for('logout') }}">Logout</a></header>
 <div class="wrap">
@@ -361,7 +360,7 @@ DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 <div class="card">
 <h2>Add a Bot</h2>
-<form method="post" action="{{ url_for('add_bot') }}" enctype="multipart/form-data">
+<form id="addform" method="post" action="{{ url_for('add_bot') }}" enctype="multipart/form-data">
   <label>Bot name</label>
   <input type="text" name="name" placeholder="e.g. My Echo Bot" required>
   <label>Bot file (.py)</label><br>
@@ -376,7 +375,23 @@ DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 Keep each bot's token separate — one token per bot, pasted only here.</p>
 </div>
 
-</div></body></html>"""
+</div>
+<script>
+// Refresh the bot list every 15s, but NEVER while the Add Bot form is in use
+// (typing, a chosen file, or focus inside the form all pause the refresh).
+setInterval(function(){
+  var f = document.getElementById('addform');
+  if (!f) { location.reload(); return; }
+  var name = f.querySelector('input[name="name"]');
+  var token = f.querySelector('input[name="token"]');
+  var file = f.querySelector('input[name="botfile"]');
+  var busy = (name && name.value) || (token && token.value) ||
+             (file && file.files && file.files.length) ||
+             f.contains(document.activeElement);
+  if (!busy) location.reload();
+}, 15000);
+</script>
+</body></html>"""
 
 LOG_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
