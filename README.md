@@ -1,4 +1,4 @@
-# MR X Bot Hosting Panel — v2 (SaaS Edition)
+# MR X Bot Hosting Panel — v3 (Jarvis Edition)
 
 A complete, sellable bot-hosting website. Visitors see a professional
 landing page, register for a free account, and host Telegram bots from
@@ -11,6 +11,29 @@ owner) generate and sell.
 > a few bots per user will truly stay up 24/7.
 
 ---
+
+## What's new in v3
+
+- **Jarvis HUD theme** — deep blue-black glassmorphism, Orbitron/Rajdhani
+  fonts, gold + cyan glow, on every page.
+- **Drag-and-drop uploads** — drop a `.py` file or a full project `.zip`.
+  ZIPs are extracted safely (path-traversal protected), the entry file
+  (`main.py` / `bot.py` / `app.py` / `run.py`, or a lone `.py`) is detected
+  automatically, and `requirements.txt` is pip-installed at add time
+  (the result lands in the bot's log).
+- **Bot management** — rename, notes, replace file/project, update token,
+  custom environment variables, duplicate, download, per-bot memory use,
+  restart count + last crash time, start all / stop all, log
+  download/clear/search.
+- **Accounts** — profile page (name, email, password change, delete
+  account), My Keys page, dashboard stats + Premium countdown bar,
+  announcement banner, WhatsApp support button.
+- **Admin** — Settings page (WhatsApp number, plan prices, free-plan bot
+  limit, announcement, maintenance mode, registration on/off), user
+  detail view, revoke Premium, export/delete unused keys, server stats
+  incl. data-folder size, stop all / restart all bots, user & bot search.
+- **Engine** — bots that were running when the panel stopped are
+  auto-restored on boot; `/api/my-bots` JSON status endpoint.
 
 ## Plans
 
@@ -148,8 +171,9 @@ is better.
 2. Open the site → **Register** (or log in as admin and use All Bots).
 3. In **Add a Bot**:
    - **Bot name:** anything, e.g. `Test Echo Bot`
-   - **Bot file:** choose `sample_bot.py` (included in this project) to
-     test, or your own bot's `.py` file.
+   - **Bot file:** drag & drop `sample_bot.py` (included in this project)
+     to test, your own bot's `.py` file, or a full project as a `.zip`
+     (extracted automatically; `requirements.txt` is installed for you).
    - **Bot token:** paste the token from BotFather.
 4. Press **Add Bot**, then press **Start** next to it.
 5. Status turns **running**. Open the bot in Telegram, send `/start` —
