@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MR X Bot Hosting Panel — v3 (Jarvis edition)
+MR X Bot Hosting Panel — v4 (Jarvis edition)
 ------------------------------------------
 A single-file Flask panel to host Telegram bots, now with:
 
@@ -139,7 +139,7 @@ def free_bot_limit():
 # --------------------------------------------------------------------------
 # Generic JSON store helpers
 # --------------------------------------------------------------------------
-_store_lock = threading.Lock()
+_store_lock = threading.RLock()  # reentrant: v4 helpers nest store access
 
 
 def _load_json(path, default):
@@ -580,7 +580,7 @@ def _log_line(bot_id, text):
         f.write(text + "\n")
 
 
-def start_bot(bot_id):
+def start_bot(bot_id, via_watchdog=False):
     bot = get_bot(bot_id)
     if not bot:
         return False
@@ -606,6 +606,7 @@ def start_bot(bot_id):
                 [sys.executable, "-u", script],
                 cwd=os.path.dirname(script) or bot_dir(bot_id),
                 env=env,
+                stdin=subprocess.PIPE,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
             )
@@ -613,10 +614,20 @@ def start_bot(bot_id):
             logf.write("[panel] ERROR: could not start process: %s\n" % e)
             logf.close()
             return False
+        # v4: the crash watchdog counts its own restarts per bot; a manual
+        # start resets the counter, a watchdog start increments it.
+        wd = 0
+        if via_watchdog and entry:
+            wd = int(entry.get("watchdog_restarts") or 0) + 1
         _processes[bot_id] = {"proc": proc, "started": time.time(),
                               "restarts": entry["restarts"] if entry else 0,
-                              "crash_seen": False}
-    update_bot(bot_id, desired_running=True)
+                              "crash_seen": False,
+                              "watchdog_restarts": wd,
+                              "restart_pending": False,
+                              "restart_at": 0.0,
+                              "exit_counted": False,
+                              "stopped_by_panel": False}
+    update_bot(bot_id, desired_running=True, last_started=int(time.time()))
     return True
 
 
@@ -624,6 +635,8 @@ def stop_bot(bot_id, mark_stopped=True):
     with _proc_lock:
         entry = _processes.get(bot_id)
         if entry and entry["proc"].poll() is None:
+            entry["stopped_by_panel"] = True  # v4: not a crash, no watchdog
+            entry["restart_pending"] = False
             entry["proc"].terminate()
             try:
                 entry["proc"].wait(timeout=5)
@@ -664,37 +677,105 @@ def bot_uptime(bot):
     return "%ds" % s
 
 
+WATCHDOG_MAX_RESTARTS = 5   # v4: watchdog retries before giving up
+WATCHDOG_BASE_DELAY = 5     # seconds; doubles each retry, capped at 60
+
+
 def _monitor_loop():
-    """Crash watcher: restarts bots that have auto-restart ON."""
-    # On panel boot: every bot that was running when the panel stopped
-    # comes back on its own (auto-restore), auto-restart or not.
+    """v4 monitor: boot restore + crash watchdog + scheduled restarts.
+
+    - On panel boot: every bot that was running when the panel stopped
+      comes back on its own (auto-restore), auto-restart or not.
+    - Crash watchdog: a bot that dies with a non-zero exit while it is
+      supposed to be running is restarted automatically — up to
+      WATCHDOG_MAX_RESTARTS times with a growing delay (5s, 10s, 20s,
+      40s, 60s). Bots with the auto-restart toggle ON are restarted
+      without the cap (v3 behaviour). Crash count and last-crash time
+      are recorded on the bot, and the owner gets a notification.
+    - Runtime accounting for analytics, per-bot scheduled restarts and
+      the premium-expiry notification sweep also live here.
+    (_notify_bot_owner / _maybe_scheduled_restart / _premium_expiry_sweep
+    are defined in the v4 section further down.)
+    """
     db = load_db()
     for bot in db["bots"]:
         if bot.get("desired_running"):
             start_bot(bot["id"])
+    last_sweep = 0.0
     while True:
         time.sleep(3)
+        now = time.time()
         db = load_db()
         for bot in db["bots"]:
+            bot_id = bot["id"]
             with _proc_lock:
-                entry = _processes.get(bot["id"])
+                entry = _processes.get(bot_id)
             if entry is not None and entry["proc"].poll() is not None \
-                    and entry["proc"].returncode not in (0, None) \
-                    and not entry.get("crash_seen"):
-                entry["crash_seen"] = True
-                update_bot(bot["id"], last_crash=int(time.time()))
-            if not (bot.get("auto_restart") and bot.get("desired_running")):
+                    and not entry.get("exit_counted"):
+                entry["exit_counted"] = True
+                dur = int(now - entry["started"])
+                if dur > 0:
+                    total = int(bot.get("total_runtime") or 0) + dur
+                    update_bot(bot_id, total_runtime=total)
+                    bot["total_runtime"] = total
+                rc = entry["proc"].returncode
+                if rc not in (0, None) and not entry.get("crash_seen"):
+                    entry["crash_seen"] = True
+                    if not entry.get("stopped_by_panel"):
+                        update_bot(bot_id, last_crash=int(now))
+                crashed = (rc not in (0, None)
+                           and not entry.get("stopped_by_panel")
+                           and bot.get("desired_running"))
+                if crashed:
+                    crashes = int(bot.get("crash_count") or 0) + 1
+                    update_bot(bot_id, crash_count=crashes,
+                               last_crash=int(now))
+                    bot["crash_count"] = crashes
+                    used = int(entry.get("watchdog_restarts") or 0)
+                    if bot.get("auto_restart") \
+                            or used < WATCHDOG_MAX_RESTARTS:
+                        delay = min(60, WATCHDOG_BASE_DELAY
+                                    * (2 ** min(used, 4)))
+                        entry["restart_pending"] = True
+                        entry["restart_at"] = now + delay
+                        _log_line(bot_id,
+                                  "[panel] watchdog: bot crashed (exit %s) "
+                                  "— restart %d in %ds"
+                                  % (rc, used + 1, delay))
+                        _notify_bot_owner(
+                            bot, "crash",
+                            "🤖 Bot '%s' crashed and will auto-restart "
+                            "in %ds (attempt %d)."
+                            % (bot["name"], delay, used + 1))
+                    else:
+                        _log_line(bot_id,
+                                  "[panel] watchdog: gave up after %d "
+                                  "restarts — bot stays crashed. Press "
+                                  "Start to run it again." % used)
+                        _notify_bot_owner(
+                            bot, "crash",
+                            "🤖 Bot '%s' crashed and the watchdog stopped "
+                            "after %d restarts. Open the panel and press "
+                            "Start." % (bot["name"], used))
+            if entry is not None and entry.get("restart_pending") \
+                    and now >= entry.get("restart_at", 0):
+                entry["restart_pending"] = False
+                fresh = get_bot(bot_id)
+                if fresh and fresh.get("desired_running"):
+                    if start_bot(bot_id, via_watchdog=True):
+                        update_bot(
+                            bot_id,
+                            restart_count=int(fresh.get("restart_count")
+                                              or 0) + 1)
+                        _notify_bot_owner(
+                            fresh, "restart",
+                            "🤖 Bot '%s' was auto-restarted by the crash "
+                            "watchdog." % fresh["name"])
                 continue
-            if entry is None or entry["proc"].poll() is not None:
-                if entry is not None and entry["proc"].returncode in (0, None):
-                    continue  # clean exit: leave it stopped
-                _log_line(bot["id"], "[panel] auto-restart: bot died, restarting...")
-                if start_bot(bot["id"]):
-                    update_bot(bot["id"],
-                               restart_count=(bot.get("restart_count") or 0) + 1)
-                    with _proc_lock:
-                        if bot["id"] in _processes:
-                            _processes[bot["id"]]["restarts"] = entry["restarts"] + 1 if entry else 1
+            _maybe_scheduled_restart(bot, now)
+        if now - last_sweep > 600:
+            last_sweep = now
+            _premium_expiry_sweep(now)
 
 
 # --------------------------------------------------------------------------
@@ -797,7 +878,7 @@ def _maintenance_gate():
         return None
     if is_admin():
         return None
-    if request.path in ("/login", "/logout"):
+    if request.path in ("/login", "/logout", "/status"):
         return None
     return render_template_string(MAINTENANCE_HTML), 503
 
@@ -1241,7 +1322,10 @@ a new key extends your Premium from your current expiry date.</p>
 USER_HEADER = """<header><div class="logo">MR X BOT HOSTING</div>
 <nav>
 <a class="ghost" href="{{ url_for('dashboard') }}">🤖 My Bots</a>
+<a class="ghost" href="{{ url_for('templates_page') }}">🧩 Templates</a>
 <a class="ghost" href="{{ url_for('my_keys') }}">🎟️ My Keys</a>
+<a class="ghost" href="{{ url_for('tickets') }}">🎫 Tickets</a>
+<a class="ghost" href="{{ url_for('notifications') }}">🔔{% if notif_unread %} ({{ notif_unread }}){% endif %}</a>
 <a class="ghost" href="{{ url_for('profile') }}">👤 Profile</a>
 <a class="ghost" href="{{ url_for('redeem') }}">💎 Redeem Key</a>
 <a class="ghost" target="_blank" rel="noopener" href="https://wa.me/{{ settings.whatsapp }}">💬 Support</a>
@@ -1327,9 +1411,9 @@ DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <tr class="botrow" data-name="{{ b.name|lower|e }}">
   <td><b>{{ b.name|e }}</b><br><span class="muted">{{ b.file|e }}</span>{% if b.notes %}<br><span class="muted">📝 {{ b.notes|e }}</span>{% endif %}</td>
   <td><span class="badge {{ b.status }}">{{ b.status }}</span></td>
-  <td>{{ b.uptime }}</td>
+  <td>{{ b.uptime }}<br><span class="muted">uptime {{ b.uptime_pct }}%</span></td>
   <td>{{ b.memory }}</td>
-  <td>{{ b.restart_count }}{% if b.last_crash %}<br><span class="muted">last crash: {{ b.last_crash }}</span>{% endif %}</td>
+  <td>{{ b.restart_count }}<br><span class="muted">crashes: {{ b.crash_count }}</span>{% if b.last_crash %}<br><span class="muted">last crash: {{ b.last_crash }}</span>{% endif %}</td>
   <td class="muted">{{ b.token_masked }}</td>
   <td>
     <form class="inline" method="post" action="{{ url_for('toggle_autorestart', bot_id=b.id) }}">
@@ -1345,6 +1429,7 @@ DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
     {% endif %}
     <a class="btn grey" href="{{ url_for('logs', bot_id=b.id) }}">Logs</a>
     <a class="btn grey" href="{{ url_for('edit_bot', bot_id=b.id) }}">Edit</a>
+    <a class="btn grey" href="{{ url_for('bot_files', bot_id=b.id) }}">📁 Files</a>
     <a class="btn grey" href="{{ url_for('download_bot', bot_id=b.id) }}">⬇ Get</a>
     <form class="inline" method="post" action="{{ url_for('duplicate_bot', bot_id=b.id) }}">
       <button class="grey" type="submit">⧉ Copy</button></form>
@@ -1427,7 +1512,16 @@ LOG_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <form class="inline" method="post" action="{{ clear_url }}" onsubmit="return confirm('Clear this log file?')"><button class="red" type="submit">🧹 Clear log</button></form>
 </div>
 <pre class="log" id="logbox">{{ log_text|e }}</pre>
-<p class="muted">Auto-refreshes every 5 seconds (pauses while you search). Showing the last 300 lines.</p></div></main>
+<p class="muted">Auto-refreshes every 5 seconds (pauses while you search). Showing the last 300 lines.</p>
+<div class="card" style="margin-top:18px">
+<h2 style="font-size:17px">⌨️ Web Console — send input to the running bot</h2>
+<form method="post" action="{{ url_for('bot_console', bot_id=bot_id) }}" style="display:flex;gap:10px">
+  <input type="text" name="line" placeholder="Type a line and press Send — it goes to the bot's stdin" style="flex:1;margin:0">
+  <button type="submit">Send ▸</button>
+</form>
+<p class="muted" style="margin-bottom:0">Only works while the bot is running and reads from standard input (input() / sys.stdin).</p>
+</div>
+</div></main>
 """ + FOOTER + """
 <script>
 (function(){
@@ -1453,8 +1547,12 @@ LOG_HTML = """<!doctype html><html><head><meta charset="utf-8">
 ADMIN_NAV = """<header><div class="logo">MR X — ADMIN</div>
 <nav>
 <a class="ghost" href="{{ url_for('admin_home') }}">📊 Stats</a>
+<a class="ghost" href="{{ url_for('admin_analytics') }}">📈 Analytics</a>
 <a class="ghost" href="{{ url_for('admin_users') }}">👥 Users</a>
 <a class="ghost" href="{{ url_for('admin_keys') }}">🎟️ Keys</a>
+<a class="ghost" href="{{ url_for('admin_promos') }}">🏷️ Promos</a>
+<a class="ghost" href="{{ url_for('admin_tickets') }}">🎫 Tickets</a>
+<a class="ghost" href="{{ url_for('admin_payments') }}">💰 Payments</a>
 <a class="ghost" href="{{ url_for('admin_bots') }}">🤖 All Bots</a>
 <a class="ghost" href="{{ url_for('admin_settings') }}">⚙️ Settings</a>
 <a href="{{ url_for('logout') }}">Logout</a>
@@ -1481,6 +1579,8 @@ ADMIN_HOME_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <a class="btn" href="{{ url_for('admin_keys') }}">🎟️ Generate License Keys</a>
 <a class="btn grey" href="{{ url_for('admin_users') }}">👥 Manage Users</a>
 <a class="btn grey" href="{{ url_for('admin_bots') }}">🤖 Manage All Bots</a>
+<a class="btn grey" href="{{ url_for('admin_analytics') }}">📈 Analytics</a>
+<a class="btn grey" href="{{ url_for('admin_backup') }}">⬇ Full Backup</a>
 <a class="btn grey" href="{{ url_for('admin_settings') }}">⚙️ Settings</a>
 <form class="inline" method="post" action="{{ url_for('admin_stop_all') }}"><button class="red" type="submit">⏹ Stop ALL Bots</button></form>
 <form class="inline" method="post" action="{{ url_for('admin_restart_all') }}"><button type="submit">🔁 Restart Running Bots</button></form>
@@ -1505,7 +1605,7 @@ ADMIN_USERS_HTML = """<!doctype html><html><head><meta charset="utf-8">
 {% if users %}
 <div class="tablewrap">
 <table>
-<tr><th>User</th><th>Plan</th><th>Premium Until</th><th>Bots</th><th>Joined</th><th>Status</th><th>Actions</th></tr>
+<tr><th>User</th><th>Plan</th><th>Premium Until</th><th>Bots</th><th>Joined</th><th>Last Login</th><th>Status</th><th>Actions</th></tr>
 {% for u in users %}
 <tr>
   <td><a href="{{ url_for('admin_user_detail', user_id=u.id) }}"><b>{{ u.name|e }}</b></a><br><span class="muted">@{{ u.username|e }}{% if u.email %} · {{ u.email|e }}{% endif %}</span></td>
@@ -1513,6 +1613,7 @@ ADMIN_USERS_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <td>{{ u.expiry }}</td>
   <td>{{ u.bot_count }}</td>
   <td>{{ u.joined }}</td>
+  <td>{{ u.last_login }}{% if u.last_ip %}<br><span class="muted">{{ u.last_ip|e }}</span>{% endif %}</td>
   <td>{% if u.banned %}<span class="badge banned">banned</span>{% else %}<span class="badge running">active</span>{% endif %}</td>
   <td>
     <form class="inline" method="post" action="{{ url_for('admin_user_grant', user_id=u.id) }}">
@@ -1639,9 +1740,9 @@ ADMIN_BOTS_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <td><b>{{ b.name|e }}</b><br><span class="muted">{{ b.file|e }}</span>{% if b.notes %}<br><span class="muted">📝 {{ b.notes|e }}</span>{% endif %}</td>
   <td>{{ b.owner_name|e }}</td>
   <td><span class="badge {{ b.status }}">{{ b.status }}</span></td>
-  <td>{{ b.uptime }}</td>
+  <td>{{ b.uptime }}<br><span class="muted">uptime {{ b.uptime_pct }}%</span></td>
   <td>{{ b.memory }}</td>
-  <td>{{ b.restart_count }}{% if b.last_crash %}<br><span class="muted">last crash: {{ b.last_crash }}</span>{% endif %}</td>
+  <td>{{ b.restart_count }}<br><span class="muted">crashes: {{ b.crash_count }}</span>{% if b.last_crash %}<br><span class="muted">last crash: {{ b.last_crash }}</span>{% endif %}</td>
   <td class="muted">{{ b.token_masked }}</td>
   <td>
     <form class="inline" method="post" action="{{ url_for('toggle_autorestart', bot_id=b.id) }}">
@@ -1739,6 +1840,33 @@ Restart the bot afterwards to use the new token.</p>
 </div>
 
 <div class="card">
+<h2>📁 File Manager</h2>
+<p class="muted" style="font-size:15px">Browse, view, edit and delete the files inside this
+bot's folder right from your browser.</p>
+<a class="btn grey" href="{{ url_for('bot_files', bot_id=bot.id) }}">Open File Manager</a>
+</div>
+
+<div class="card">
+<h2>⏰ Scheduled Restart</h2>
+<p class="muted" style="font-size:15px">Automatically restart this bot every day at a set
+time, or every N hours. Current setting:
+<b style="color:#eee">{{ bot.sched_label }}</b></p>
+<form method="post" action="{{ url_for('bot_schedule', bot_id=bot.id) }}">
+  <label>Mode</label>
+  <select name="sched_mode">
+    <option value="off" {% if bot.sched_mode == 'off' %}selected{% endif %}>Off</option>
+    <option value="daily" {% if bot.sched_mode == 'daily' %}selected{% endif %}>Daily at a set time</option>
+    <option value="interval" {% if bot.sched_mode == 'interval' %}selected{% endif %}>Every N hours</option>
+  </select>
+  <label>Daily time (server time, 24h — e.g. 04:00)</label>
+  <input type="text" name="sched_time" value="{{ bot.sched_time|e }}" placeholder="04:00" pattern="[0-9]{2}:[0-9]{2}">
+  <label>Interval in hours (for "Every N hours" mode)</label>
+  <input type="number" name="sched_hours" value="{{ bot.sched_hours }}" min="1" max="720">
+  <button type="submit">Save Schedule</button>
+</form>
+</div>
+
+<div class="card">
 <h2>🧪 Environment Variables</h2>
 <p class="muted" style="font-size:15px">One variable per line, as <b>KEY=value</b>. These are passed
 to your bot when it starts (read them with os.environ). BOT_TOKEN is managed by the token form above.
@@ -1784,6 +1912,20 @@ PROFILE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </form>
 </div>
 
+<div class="card">
+<h2>🔌 API Access</h2>
+<p class="muted" style="font-size:15px">Control your bots from your own scripts with a
+personal API key — list bots, start and stop them over HTTP.</p>
+<a class="btn grey" href="{{ url_for('api_page') }}">Open API Page</a>
+</div>
+
+<div class="card">
+<h2>⬇ Backup My Bots</h2>
+<p class="muted" style="font-size:15px">Download ALL your bots (files and projects) as one
+ZIP. Bot tokens are never included in downloads — re-add them after a restore.</p>
+<a class="btn grey" href="{{ url_for('backup_my_bots') }}">Download Backup (.zip)</a>
+</div>
+
 <div class="card" style="border-color:rgba(248,113,113,.5)">
 <h2 style="color:#f87171">⚠️ Delete My Account</h2>
 <p class="muted" style="font-size:15px">This permanently deletes your account and ALL your bots.
@@ -1805,6 +1947,33 @@ MYKEYS_HTML = """<!doctype html><html><head><meta charset="utf-8">
 """ + USER_HEADER + """
 <main><div class="wrap">
 {% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+
+<div class="card">
+<h2>🏷️ Redeem a Promo Code</h2>
+<p class="muted" style="font-size:15px">Got a promo code (for example from a launch offer)?
+Enter it here — the Premium days are added to your account instantly.
+Each code works once per user.</p>
+<form method="post" action="{{ url_for('redeem_promo') }}" style="display:flex;gap:10px;flex-wrap:wrap">
+  <input type="text" name="code" placeholder="PROMO CODE" required
+         style="flex:1;min-width:200px;margin:0;font-family:Consolas,monospace;text-transform:uppercase">
+  <button type="submit">Redeem Promo</button>
+</form>
+</div>
+
+<div class="card">
+<h2>👥 Refer &amp; Earn Free Premium</h2>
+<p class="muted" style="font-size:15px">Share your referral link. When a friend signs up with
+it <b style="color:#eee">and redeems any Premium key or promo</b>, you earn
+<b style="color:#eee">+2 free Premium days</b> — automatically.</p>
+<label>Your referral link</label>
+<input type="text" readonly value="{{ ref_link }}" onclick="this.select()">
+<div class="stats" style="margin:0">
+  <div class="stat"><div class="num">{{ ref_count }}</div><div class="lbl">Friends Joined</div></div>
+  <div class="stat"><div class="num">{{ ref_credited }}</div><div class="lbl">Referrals Paid Out</div></div>
+  <div class="stat"><div class="num">{{ ref_days }}</div><div class="lbl">Free Days Earned</div></div>
+</div>
+</div>
+
 <div class="card">
 <h2>🎟️ My Redeemed Keys</h2>
 {% if keys %}
@@ -1877,6 +2046,7 @@ ADMIN_USER_DETAIL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <table>
 <tr><th style="width:210px">Email</th><td>{{ u.email|e or '—' }}</td></tr>
 <tr><th>Joined</th><td>{{ u.joined }}</td></tr>
+<tr><th>Last Login</th><td>{{ u.last_login_fmt }}{% if u.last_ip %} · IP {{ u.last_ip|e }}{% endif %}</td></tr>
 <tr><th>Plan</th><td><span class="badge {{ 'plan-premium' if u.plan == 'Premium' else 'plan-free' }}">{{ u.plan }}</span></td></tr>
 <tr><th>Premium Until</th><td>{{ u.expiry }}</td></tr>
 <tr><th>Status</th><td>{% if u.banned %}<span class="badge banned">banned</span>{% else %}<span class="badge running">active</span>{% endif %}</td></tr>
@@ -1894,6 +2064,18 @@ ADMIN_USER_DETAIL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 {% endfor %}
 </table></div>
 {% else %}<p class="muted">This user has no bots.</p>{% endif %}
+</div>
+
+<div class="card">
+<h2>🕐 Login History</h2>
+{% if u.login_log %}
+<div class="tablewrap"><table>
+<tr><th>When</th><th>IP</th></tr>
+{% for e in u.login_log %}
+<tr><td>{{ e.ts }}</td><td>{{ e.ip|e }}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No logins recorded yet (logins are tracked since v4).</p>{% endif %}
 </div>
 
 <div class="card">
@@ -1945,6 +2127,9 @@ def register():
         return redirect(url_for("admin_home"))
     if current_user() is not None:
         return redirect(url_for("dashboard"))
+    ref = (request.args.get("ref") or "").strip()
+    if ref:
+        session["pending_ref"] = ref[:40]
     if not load_settings().get("registration_open", True):
         return render_template_string(REGISTER_HTML, error=None, closed=True,
                                       name="", username="", email="")
@@ -1967,8 +2152,17 @@ def register():
         elif find_user_by_username(username) is not None:
             error = "That username is already taken. Try another."
         else:
+            reg_ip = (request.headers.get("X-Forwarded-For")
+                      or request.remote_addr or "").split(",")[0].strip()
             with _store_lock:
                 data = load_users()
+                referred_by = None
+                pending_ref = (session.get("pending_ref") or "").upper()
+                if pending_ref:
+                    for u in data["users"]:
+                        if (u.get("ref_code") or "").upper() == pending_ref:
+                            referred_by = u["id"]
+                            break
                 user = {
                     "id": secrets.token_hex(6),
                     "name": name,
@@ -1978,9 +2172,16 @@ def register():
                     "premium_until": 0,
                     "banned": False,
                     "created": int(time.time()),
+                    "ref_code": make_ref_code(),
+                    "referred_by": referred_by,
+                    "referral_credited": False,
+                    "last_login": int(time.time()),
+                    "last_ip": reg_ip,
+                    "login_log": [{"ts": int(time.time()), "ip": reg_ip}],
                 }
                 data["users"].append(user)
                 save_users(data)
+            session.pop("pending_ref", None)
             session.clear()
             session["user_id"] = user["id"]
             flash("Welcome to MR X Bot Hosting! Your Free plan is active — add up to 2 bots.")
@@ -2012,6 +2213,19 @@ def login():
             elif user.get("banned"):
                 error = "This account has been banned. Please contact the owner."
             else:
+                # v4: login history (last login time + IP, recent logins)
+                ip = (request.headers.get("X-Forwarded-For")
+                      or request.remote_addr or "").split(",")[0].strip()
+                with _store_lock:
+                    data = load_users()
+                    for u in data["users"]:
+                        if u["id"] == user["id"]:
+                            u["last_login"] = int(time.time())
+                            u["last_ip"] = ip
+                            log = u.get("login_log") or []
+                            log.append({"ts": int(time.time()), "ip": ip})
+                            u["login_log"] = log[-20:]
+                    save_users(data)
                 session.clear()
                 session["user_id"] = user["id"]
                 return redirect(url_for("dashboard"))
@@ -2035,6 +2249,8 @@ def _dash_context(user):
         b["uptime"] = bot_uptime(bot)
         b["memory"] = bot_memory(bot)
         b["restart_count"] = bot.get("restart_count") or 0
+        b["crash_count"] = bot.get("crash_count") or 0
+        b["uptime_pct"] = bot_uptime_pct(bot)
         b["last_crash"] = (fmt_datetime(bot.get("last_crash"))
                            if bot.get("last_crash") else "")
         b["notes"] = bot.get("notes") or ""
@@ -2112,6 +2328,7 @@ def redeem():
                 rec["used_at"] = now
                 rec["resulting_expiry"] = new_expiry
                 save_keys(data)
+                _credit_referrer(user)  # v4: referral bonus, first redeem only
                 flash("🎉 Premium activated! Your Premium is now active until %s."
                       % fmt_date(new_expiry))
                 return redirect(url_for("dashboard"))
@@ -2258,7 +2475,7 @@ def logs(bot_id):
     else:
         back_url, back_label = url_for("dashboard"), "← Dashboard"
     return render_template_string(
-        LOG_HTML, name=bot["name"], log_text=text,
+        LOG_HTML, name=bot["name"], log_text=text, bot_id=bot_id,
         back_url=back_url, back_label=back_label,
         download_url=url_for("logs_download", bot_id=bot_id),
         clear_url=url_for("logs_clear", bot_id=bot_id))
@@ -2352,7 +2569,11 @@ def my_keys():
                            if k.get("resulting_expiry") else "—"),
             })
     rows.reverse()
-    return render_template_string(MYKEYS_HTML, keys=rows, flash=pop_flash())
+    ref = referral_stats(user)
+    return render_template_string(
+        MYKEYS_HTML, keys=rows, flash=pop_flash(),
+        ref_link=ref["link"], ref_count=ref["joined"],
+        ref_credited=ref["credited"], ref_days=ref["days"])
 
 
 def _bot_or_404(bot_id):
@@ -2372,6 +2593,15 @@ def edit_bot(bot_id):
     b = dict(bot)
     b["status"] = bot_status(bot)
     b["notes"] = bot.get("notes") or ""
+    b["sched_mode"] = bot.get("sched_mode") or "off"
+    b["sched_time"] = bot.get("sched_time") or ""
+    b["sched_hours"] = bot.get("sched_hours") or 24
+    if b["sched_mode"] == "daily":
+        b["sched_label"] = "Daily at %s" % (b["sched_time"] or "—")
+    elif b["sched_mode"] == "interval":
+        b["sched_label"] = "Every %s hour(s)" % b["sched_hours"]
+    else:
+        b["sched_label"] = "Off"
     if is_admin():
         back_url = url_for("admin_bots")
     else:
@@ -2642,6 +2872,9 @@ def admin_users():
         row["expiry"] = fmt_date(u.get("premium_until")) if user_is_premium(u) else "—"
         row["bot_count"] = counts.get(u["id"], 0)
         row["joined"] = fmt_date(u.get("created"))
+        row["last_login"] = (fmt_datetime(u.get("last_login"))
+                             if u.get("last_login") else "never")
+        row["last_ip"] = u.get("last_ip") or ""
         users.append(row)
     users.sort(key=lambda x: x.get("created") or 0, reverse=True)
     q = (request.args.get("q") or "").strip().lower()
@@ -2664,6 +2897,10 @@ def admin_user_ban(user_id):
                 u["banned"] = True
                 flash("User @%s has been banned." % u["username"])
         save_users(data)
+    # v4: a banned user's bots stop too (and stay stopped — desired_running
+    # is cleared by stop_bot, so the watchdog/boot-restore won't revive them)
+    for bot in list(user_bots(user_id)):
+        stop_bot(bot["id"])
     return redirect(url_for("admin_users"))
 
 
@@ -2789,6 +3026,8 @@ def admin_bots():
         b["uptime"] = bot_uptime(bot)
         b["memory"] = bot_memory(bot)
         b["restart_count"] = bot.get("restart_count") or 0
+        b["crash_count"] = bot.get("crash_count") or 0
+        b["uptime_pct"] = bot_uptime_pct(bot)
         b["last_crash"] = (fmt_datetime(bot.get("last_crash"))
                            if bot.get("last_crash") else "")
         b["notes"] = bot.get("notes") or ""
@@ -2812,6 +3051,7 @@ def admin_bots():
 @admin_required
 def admin_settings():
     s = load_settings()
+    old_announcement = s.get("announcement") or ""
     if request.method == "POST":
         wa = "".join(c for c in (request.form.get("whatsapp") or "")
                      if c.isdigit())
@@ -2832,6 +3072,11 @@ def admin_settings():
         s["maintenance"] = bool(request.form.get("maintenance"))
         s["registration_open"] = bool(request.form.get("registration_open"))
         save_settings(s)
+        # v4: a new/changed announcement is also broadcast as a
+        # notification to every user (integrates with the existing
+        # announcement setting instead of duplicating it).
+        if s["announcement"] and s["announcement"] != old_announcement:
+            notify_all("announcement", "📣 " + s["announcement"])
         flash("Settings saved.")
         return redirect(url_for("admin_settings"))
     return render_template_string(ADMIN_SETTINGS_HTML, settings=s,
@@ -2849,6 +3094,10 @@ def admin_user_detail(user_id):
     u["expiry"] = (fmt_date(user.get("premium_until"))
                    if user_is_premium(user) else "—")
     u["joined"] = fmt_datetime(user.get("created"))
+    u["last_login_fmt"] = (fmt_datetime(user.get("last_login"))
+                           if user.get("last_login") else "never")
+    u["login_log"] = [{"ts": fmt_datetime(e.get("ts")), "ip": e.get("ip") or ""}
+                      for e in (user.get("login_log") or [])][::-1]
     bots = []
     for bot in user_bots(user_id):
         b = dict(bot)
@@ -2930,13 +3179,1876 @@ def health():
     return "ok"
 
 
+
+
+# ==========================================================================
+# v4 — BIG upgrade: crash watchdog helpers, analytics, GitHub deploy,
+# templates, file manager, web console, scheduled restarts, referrals,
+# promo codes, support tickets, notifications, backups, public status
+# page, user API keys + REST API, admin analytics & payment records.
+# ==========================================================================
+PANEL_STARTED = time.time()
+
+PROMOS_FILE = os.path.join(DATA_DIR, "promos.json")
+TICKETS_FILE = os.path.join(DATA_DIR, "tickets.json")
+NOTIFS_FILE = os.path.join(DATA_DIR, "notifications.json")
+PAYMENTS_FILE = os.path.join(DATA_DIR, "payments.json")
+REFERRAL_BONUS_DAYS = 2
+
+
+def load_promos():
+    return _load_json(PROMOS_FILE, {"promos": []})
+
+
+def save_promos(data):
+    _save_json(PROMOS_FILE, data)
+
+
+def load_tickets():
+    return _load_json(TICKETS_FILE, {"tickets": []})
+
+
+def save_tickets(data):
+    _save_json(TICKETS_FILE, data)
+
+
+def load_notifications():
+    return _load_json(NOTIFS_FILE, {"notes": []})
+
+
+def save_notifications(data):
+    _save_json(NOTIFS_FILE, data)
+
+
+def load_payments():
+    return _load_json(PAYMENTS_FILE, {"payments": []})
+
+
+def save_payments(data):
+    _save_json(PAYMENTS_FILE, data)
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — formatting & analytics
+# --------------------------------------------------------------------------
+def fmt_duration(secs):
+    secs = int(secs or 0)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh %dm" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd %dh" % (secs // 86400, (secs % 86400) // 3600)
+
+
+def bot_uptime_pct(bot):
+    """Lifetime uptime %: recorded runtime (+ current run) vs bot age."""
+    created = int(bot.get("created") or 0)
+    if not created:
+        return 0
+    age = max(1, int(time.time()) - created)
+    run = int(bot.get("total_runtime") or 0)
+    with _proc_lock:
+        entry = _processes.get(bot["id"])
+    if entry and entry["proc"].poll() is None:
+        run += int(time.time() - entry["started"])
+    return max(0, min(100, int(round(run * 100.0 / age))))
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — notifications center
+# --------------------------------------------------------------------------
+def notify(user_id, kind, text):
+    """Add a notification for one user (user_id may be 'all')."""
+    with _store_lock:
+        data = load_notifications()
+        data["notes"].append({
+            "id": secrets.token_hex(6),
+            "user_id": user_id,
+            "kind": kind,
+            "text": text,
+            "ts": int(time.time()),
+            "read": False,
+        })
+        data["notes"] = data["notes"][-600:]  # keep the store bounded
+        save_notifications(data)
+
+
+def notify_all(kind, text):
+    notify("all", kind, text)
+
+
+def _notify_bot_owner(bot, kind, text):
+    owner = bot.get("owner")
+    if owner:
+        notify(owner, kind, text)
+
+
+def unread_count(user_id):
+    user = get_user(user_id)
+    seen = int(user.get("notif_seen_ts") or 0) if user else 0
+    n = 0
+    for note in load_notifications()["notes"]:
+        if note.get("user_id") == user_id and not note.get("read"):
+            n += 1
+        elif note.get("user_id") == "all" and int(note.get("ts") or 0) > seen:
+            n += 1
+    return n
+
+
+@app.context_processor
+def _inject_notif_count():
+    try:
+        user = current_user()
+        if user:
+            return {"notif_unread": unread_count(user["id"])}
+    except Exception:
+        pass
+    return {"notif_unread": 0}
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — referrals
+# --------------------------------------------------------------------------
+def make_ref_code():
+    return "REF-" + "".join(secrets.choice(_KEY_ALPHABET) for _ in range(6))
+
+
+def ensure_ref_code(user):
+    """Return the user's referral code, generating + saving one if needed."""
+    if user.get("ref_code"):
+        return user["ref_code"]
+    code = make_ref_code()
+    with _store_lock:
+        data = load_users()
+        for u in data["users"]:
+            if u["id"] == user["id"]:
+                u["ref_code"] = code
+        save_users(data)
+    return code
+
+
+def referral_stats(user):
+    code = ensure_ref_code(user)
+    joined = credited = 0
+    for u in load_users()["users"]:
+        if u.get("referred_by") == user["id"]:
+            joined += 1
+            if u.get("referral_credited"):
+                credited += 1
+    return {
+        "code": code,
+        "link": request.host_url + "register?ref=" + code,
+        "joined": joined,
+        "credited": credited,
+        "days": credited * REFERRAL_BONUS_DAYS,
+    }
+
+
+def _credit_referrer(user):
+    """When a referred user redeems premium for the first time, the
+    referrer earns +REFERRAL_BONUS_DAYS premium days (once per friend)."""
+    ref_id = user.get("referred_by")
+    if not ref_id or ref_id == user["id"] or user.get("referral_credited"):
+        return
+    credited = False
+    with _store_lock:
+        data = load_users()
+        for u in data["users"]:
+            if u["id"] == user["id"] and not u.get("referral_credited"):
+                u["referral_credited"] = True
+                credited = True
+        if credited:
+            for u in data["users"]:
+                if u["id"] == ref_id:
+                    base = max(int(time.time()),
+                               int(u.get("premium_until") or 0))
+                    u["premium_until"] = base + REFERRAL_BONUS_DAYS * 86400
+            save_users(data)
+    if credited:
+        notify(ref_id, "referral",
+               "🎉 Your referral @%s just went Premium — you earned "
+               "+%d free Premium days!" % (user["username"],
+                                           REFERRAL_BONUS_DAYS))
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — monitor-loop extras (scheduled restarts, expiry sweep)
+# --------------------------------------------------------------------------
+def _do_scheduled_restart(bot):
+    _log_line(bot["id"], "[panel] scheduled restart")
+    stop_bot(bot["id"], mark_stopped=False)
+    if start_bot(bot["id"]):
+        update_bot(bot["id"],
+                   restart_count=int(bot.get("restart_count") or 0) + 1)
+    _notify_bot_owner(bot, "schedule",
+                      "🤖 Bot '%s' was restarted on its schedule."
+                      % bot["name"])
+
+
+def _maybe_scheduled_restart(bot, now):
+    mode = bot.get("sched_mode") or "off"
+    if mode == "off" or not bot.get("desired_running"):
+        return
+    if bot_status(bot) != "running":
+        return
+    lt = time.localtime(now)
+    if mode == "daily":
+        want = (bot.get("sched_time") or "").strip()
+        today = time.strftime("%Y-%m-%d", lt)
+        if want and "%02d:%02d" % (lt.tm_hour, lt.tm_min) == want \
+                and bot.get("last_sched_day") != today:
+            update_bot(bot["id"], last_sched_day=today,
+                       last_sched_restart=int(now))
+            _do_scheduled_restart(bot)
+    elif mode == "interval":
+        try:
+            hrs = int(bot.get("sched_hours") or 0)
+        except (TypeError, ValueError):
+            hrs = 0
+        if hrs >= 1:
+            base = int(bot.get("last_sched_restart")
+                       or bot.get("last_started")
+                       or bot.get("created") or now)
+            if now - base >= hrs * 3600:
+                update_bot(bot["id"], last_sched_restart=int(now))
+                _do_scheduled_restart(bot)
+
+
+def _premium_expiry_sweep(now):
+    """Notify premium users once when <24h of Premium remain."""
+    for user in load_users()["users"]:
+        until = int(user.get("premium_until") or 0)
+        if until - now > 0 and until - now <= 86400 \
+                and user.get("expiry_notified_for") != until:
+            notify(user["id"], "premium",
+                   "⏰ Your Premium expires soon — on %s. Renew with a "
+                   "new key to keep unlimited bots." % fmt_datetime(until))
+            with _store_lock:
+                data = load_users()
+                for u in data["users"]:
+                    if u["id"] == user["id"]:
+                        u["expiry_notified_for"] = until
+                save_users(data)
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — bot creation shared by GitHub deploy & templates
+# --------------------------------------------------------------------------
+def _new_bot_id():
+    return "%s-%s" % (secrets.token_hex(3), int(time.time()))
+
+
+def _register_bot(bot_id, owner, name, entry_rel, kind, token, auto_restart):
+    """Write config.env + the bots.json record for an already-placed bot."""
+    if token:
+        with open(os.path.join(bot_dir(bot_id), "config.env"), "w") as f:
+            f.write("BOT_TOKEN=%s\n" % token)
+    masked = ("••••" + token[-4:]) if len(token) >= 4 else \
+        ("••••" if token else "—")
+    with _db_lock:
+        db = load_db()
+        db["bots"].append({
+            "id": bot_id,
+            "owner": owner,
+            "name": name,
+            "file": entry_rel,
+            "kind": kind,
+            "notes": "",
+            "restart_count": 0,
+            "crash_count": 0,
+            "total_runtime": 0,
+            "last_crash": None,
+            "token_masked": masked,
+            "auto_restart": bool(auto_restart),
+            "desired_running": False,
+            "created": int(time.time()),
+        })
+        save_db(db)
+    _log_line(bot_id, "[panel] bot '%s' added (%s)" % (name, entry_rel))
+
+
+def _check_bot_quota():
+    """(owner, error_response) for add-style routes; error None = allowed."""
+    if is_admin():
+        return None, None
+    user = current_user()
+    if len(user_bots(user["id"])) >= user_bot_limit(user):
+        if user_is_premium(user):
+            flash("Bot limit reached (%d bots)." % user_bot_limit(user), "err")
+        else:
+            flash("Free plan limit reached — redeem a Premium key for "
+                  "unlimited bots.", "err")
+        return None, redirect(url_for("dashboard"))
+    return user["id"], None
+
+
+# --------------------------------------------------------------------------
+# v4 helpers — per-bot file manager safety
+# --------------------------------------------------------------------------
+_EDITABLE_EXTS = {".py", ".txt", ".md", ".json", ".cfg", ".ini", ".html",
+                  ".css", ".js", ".yaml", ".yml", ".toml", ".sh", ".csv"}
+_MAX_EDIT_BYTES = 512 * 1024
+
+
+def _safe_bot_path(bot_id, rel):
+    """Resolve rel inside the bot dir; None when unsafe or the token file."""
+    base = os.path.realpath(bot_dir(bot_id))
+    rel = (rel or "").replace("\\", "/").lstrip("/")
+    if not rel:
+        return None
+    target = os.path.realpath(os.path.join(base, rel))
+    if target != base and not target.startswith(base + os.sep):
+        return None
+    if os.path.basename(target) == "config.env":
+        return None  # holds the bot token — never viewable/editable here
+    return target
+
+
+def _list_bot_files(bot_id):
+    base = bot_dir(bot_id)
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in filenames:
+            if fn == "config.env":
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            rows.append({
+                "rel": os.path.relpath(full, base).replace(os.sep, "/"),
+                "size": fmt_size(st.st_size),
+                "mtime": fmt_datetime(int(st.st_mtime)),
+                "editable": os.path.splitext(fn)[1].lower() in _EDITABLE_EXTS
+                            and st.st_size <= _MAX_EDIT_BYTES,
+            })
+    rows.sort(key=lambda r: r["rel"])
+    return rows
+
+
+# --------------------------------------------------------------------------
+# v4 — built-in bot templates (stdlib only, like sample_bot.py: they run
+# anywhere with zero pip installs; token comes from BOT_TOKEN)
+# --------------------------------------------------------------------------
+_TEMPLATE_COMMON = '''import os, json, time, urllib.request
+
+TOKEN = os.environ.get("BOT_TOKEN", "")
+API = "https://api.telegram.org/bot%s/" % TOKEN
+
+def call(method, params=None):
+    data = json.dumps(params).encode() if params else None
+    req = urllib.request.Request(API + method, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode())
+
+def send(chat_id, text):
+    try:
+        call("sendMessage", {"chat_id": chat_id, "text": text})
+    except Exception:
+        pass
+
+def wait_for_token():
+    while not TOKEN:
+        print("BOT_TOKEN is not set - paste your token in the panel.")
+        time.sleep(30)
+
+'''
+
+TEMPLATES = {
+    "echo": {
+        "name": "Echo Bot",
+        "icon": "🔁",
+        "desc": "Repeats back anything you send it. The classic first bot — "
+                "perfect for testing your token and the panel.",
+        "code": _TEMPLATE_COMMON + '''
+def main():
+    wait_for_token()
+    print("Echo bot started")
+    offset = 0
+    while True:
+        try:
+            res = call("getUpdates", {"offset": offset, "timeout": 30})
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = (msg.get("chat") or {}).get("id")
+                text = msg.get("text")
+                if chat and text:
+                    if text == "/start":
+                        send(chat, "Hello! I am an Echo Bot. Send me "
+                                   "anything and I will repeat it.")
+                    else:
+                        send(chat, text)
+        except Exception as e:
+            print("error:", e)
+            time.sleep(5)
+
+main()
+''',
+    },
+    "welcome": {
+        "name": "Welcome Bot",
+        "icon": "👋",
+        "desc": "Greets every new member who joins your group, by name. "
+                "Add it to a group and make it admin for best results.",
+        "code": _TEMPLATE_COMMON + '''
+def main():
+    wait_for_token()
+    print("Welcome bot started")
+    offset = 0
+    while True:
+        try:
+            res = call("getUpdates", {"offset": offset, "timeout": 30})
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = (msg.get("chat") or {}).get("id")
+                if not chat:
+                    continue
+                for member in msg.get("new_chat_members") or []:
+                    name = member.get("first_name") or "friend"
+                    send(chat, "Welcome, %s! Glad to have you here. "
+                               "Please read the group rules and say hello."
+                               % name)
+                text = msg.get("text")
+                if text == "/start":
+                    send(chat, "I am a Welcome Bot. Add me to a group and "
+                               "I will greet every new member.")
+        except Exception as e:
+            print("error:", e)
+            time.sleep(5)
+
+main()
+''',
+    },
+    "idbot": {
+        "name": "ID Bot",
+        "icon": "🪪",
+        "desc": "Tells users their Telegram user ID and the chat ID — "
+                "handy for setting up admins, panels and other bots.",
+        "code": _TEMPLATE_COMMON + '''
+def main():
+    wait_for_token()
+    print("ID bot started")
+    offset = 0
+    while True:
+        try:
+            res = call("getUpdates", {"offset": offset, "timeout": 30})
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = (msg.get("chat") or {}).get("id")
+                user = msg.get("from") or {}
+                text = msg.get("text") or ""
+                if chat and text.startswith("/start"):
+                    send(chat, "Send /id and I will tell you your "
+                               "Telegram user ID and this chat ID.")
+                elif chat and text.startswith("/id"):
+                    send(chat, "Your user ID: %s\\nThis chat ID: %s\\n"
+                               "Username: @%s"
+                               % (user.get("id"), chat,
+                                  user.get("username") or "-"))
+        except Exception as e:
+            print("error:", e)
+            time.sleep(5)
+
+main()
+''',
+    },
+    "guard": {
+        "name": "Group Guard Lite",
+        "icon": "🛡️",
+        "desc": "Deletes links posted by regular members in your group "
+                "(admins can post freely) and warns the sender. Make the "
+                "bot a group admin so it can delete messages.",
+        "code": _TEMPLATE_COMMON + '''
+def is_admin(chat_id, user_id):
+    try:
+        res = call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+        return (res.get("result") or {}).get("status") in (
+            "administrator", "creator")
+    except Exception:
+        return False
+
+def has_link(msg):
+    text = msg.get("text") or msg.get("caption") or ""
+    for ent in (msg.get("entities") or []) + (msg.get("caption_entities") or []):
+        if ent.get("type") in ("url", "text_link"):
+            return True
+    low = text.lower()
+    return "http://" in low or "https://" in low or "t.me/" in low
+
+def main():
+    wait_for_token()
+    print("Group Guard Lite started")
+    offset = 0
+    while True:
+        try:
+            res = call("getUpdates", {"offset": offset, "timeout": 30})
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                user = msg.get("from") or {}
+                if chat.get("type") not in ("group", "supergroup"):
+                    if (msg.get("text") or "") == "/start" and chat.get("id"):
+                        send(chat["id"], "Add me to a group as admin and "
+                                         "I will remove links from members.")
+                    continue
+                if has_link(msg) and not is_admin(chat["id"], user.get("id")):
+                    try:
+                        call("deleteMessage", {"chat_id": chat["id"],
+                                               "message_id": msg["message_id"]})
+                        send(chat["id"], "Links are not allowed here, %s."
+                             % (user.get("first_name") or "friend"))
+                    except Exception as e:
+                        print("could not delete (am I admin?):", e)
+        except Exception as e:
+            print("error:", e)
+            time.sleep(5)
+
+main()
+''',
+    },
+}
+
+# --------------------------------------------------------------------------
+# v4 HTML templates
+# --------------------------------------------------------------------------
+V4_BADGE_CSS = """
+<style>
+  .topen { background:rgba(91,26,26,.6); color:#f87171; border-color:rgba(248,113,113,.45); }
+  .tans { background:rgba(20,83,45,.6); color:#4ade80; border-color:rgba(74,222,128,.45); }
+  .tclosed { background:rgba(60,70,84,.5); color:#b9cbdd; border-color:rgba(185,203,221,.3); }
+  .abar { height:14px; background:rgba(255,255,255,.06); border:1px solid rgba(53,211,247,.3);
+          border-radius:7px; overflow:hidden; min-width:120px; }
+  .abar > div { height:100%; background:linear-gradient(90deg,#1d7ea8,#35d3f7); }
+  .abar.gold > div { background:linear-gradient(90deg,#c9a227,#e8c95a); }
+</style>
+"""
+
+TEMPLATES_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Templates — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap">
+<h2 style="font-size:26px">🧩 One-Click Bot Templates</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<p class="muted" style="font-size:15.5px">No code needed. Pick a ready-made bot, paste a token
+from @BotFather, and it is deployed instantly — then press Start on your dashboard.</p>
+<div class="grid">
+{% for t in templates %}
+<div class="feature">
+  <div class="icon">{{ t.icon }}</div>
+  <h3>{{ t.name|e }}</h3>
+  <p>{{ t.desc|e }}</p>
+  <form method="post" action="{{ url_for('template_deploy', key=t.key) }}" style="margin-top:14px">
+    <input type="text" name="name" value="{{ t.name|e }}" required>
+    <input type="text" name="token" placeholder="Bot token from @BotFather" required>
+    <button type="submit" style="width:100%">⚡ Deploy This Bot</button>
+  </form>
+</div>
+{% endfor %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+GITHUB_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deploy from GitHub — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap"><div class="card" style="max-width:620px;margin:0 auto">
+<h2>🐙 Deploy from GitHub</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+{% if error %}<div class="err">{{ error }}</div>{% endif %}
+<p class="muted" style="font-size:15px">Paste a <b style="color:#eee">public</b> GitHub
+repository URL. The panel clones it, finds the entry file (main.py / bot.py / app.py /
+run.py) and installs requirements.txt — just like a ZIP upload.</p>
+<form method="post">
+  <label>Bot name</label>
+  <input type="text" name="name" placeholder="e.g. My GitHub Bot" required>
+  <label>GitHub repository URL</label>
+  <input type="text" name="repo" placeholder="https://github.com/username/repo" required>
+  <label>Bot token (from @BotFather)</label>
+  <input type="text" name="token" placeholder="123456:ABC... (optional if set inside the repo)">
+  <label><input type="checkbox" name="auto_restart"> Auto-restart if the bot crashes</label>
+  <br><br>
+  <button type="submit" style="width:100%;padding:13px">Clone &amp; Deploy</button>
+</form>
+</div></div></main>
+""" + FOOTER + """</body></html>"""
+
+FILES_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Files — {{ bot.name|e }}</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap">
+<p><a class="btn grey" href="{{ back_url }}">← Back</a></p>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>📁 Files — {{ bot.name|e }}</h2>
+<p class="muted" style="font-size:15px">Files inside this bot's folder. The token file
+(config.env) is never shown here. Restart the bot after editing code.</p>
+{% if files %}
+<div class="tablewrap"><table>
+<tr><th>File</th><th>Size</th><th>Modified</th><th>Actions</th></tr>
+{% for f in files %}
+<tr>
+  <td><b>{{ f.rel|e }}</b></td>
+  <td>{{ f.size }}</td>
+  <td class="muted">{{ f.mtime }}</td>
+  <td>
+    {% if f.editable %}
+    <a class="btn grey" href="{{ url_for('bot_file_view', bot_id=bot.id, path=f.rel) }}">✏️ View / Edit</a>
+    {% endif %}
+    <form class="inline" method="post" action="{{ url_for('bot_file_delete', bot_id=bot.id) }}"
+          onsubmit="return confirm('Delete this file?')">
+      <input type="hidden" name="path" value="{{ f.rel|e }}">
+      <button class="red" type="submit">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No files found in this bot's folder.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+FILE_EDIT_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edit File — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap">
+<p><a class="btn grey" href="{{ url_for('bot_files', bot_id=bot.id) }}">← All Files</a></p>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>✏️ {{ path|e }}</h2>
+<p class="muted" style="font-size:15px">Bot: <b style="color:#eee">{{ bot.name|e }}</b> ·
+Save, then restart the bot to run the new code.</p>
+<form method="post" action="{{ url_for('bot_file_save', bot_id=bot.id) }}">
+  <input type="hidden" name="path" value="{{ path|e }}">
+  <textarea name="content" style="font-family:Consolas,monospace;min-height:55vh;font-size:14px">{{ content|e }}</textarea>
+  <button type="submit" style="padding:13px 30px">💾 Save File</button>
+</form>
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+NOTIF_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notifications — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap" style="max-width:820px">
+<h2 style="font-size:26px">🔔 Notifications</h2>
+{% if notes %}
+{% for n in notes %}
+<div class="card" style="padding:18px 24px;margin-bottom:14px;{% if n.fresh %}border-color:rgba(212,175,55,.6){% endif %}">
+  <div style="font-size:16.5px">{{ n.text|e }}</div>
+  <div class="muted">{{ n.when }}</div>
+</div>
+{% endfor %}
+{% else %}
+<div class="card"><p class="muted">No notifications yet. Bot crashes, ticket replies,
+announcements and Premium reminders will appear here.</p></div>
+{% endif %}
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+TICKETS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support Tickets — MR X Bot Hosting</title>""" + CSS + V4_BADGE_CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap">
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>🎫 Open a Support Ticket</h2>
+<form method="post">
+  <label>Subject</label>
+  <input type="text" name="subject" placeholder="e.g. My bot keeps stopping" required>
+  <label>Message</label>
+  <textarea name="message" placeholder="Describe the problem in detail..." required></textarea>
+  <button type="submit" style="padding:12px 28px">Open Ticket</button>
+</form>
+</div>
+<div class="card">
+<h2>My Tickets ({{ tickets|length }})</h2>
+{% if tickets %}
+<div class="tablewrap"><table>
+<tr><th>Subject</th><th>Status</th><th>Updated</th><th></th></tr>
+{% for t in tickets %}
+<tr>
+  <td><b>{{ t.subject|e }}</b></td>
+  <td><span class="badge t{{ t.status }}">{{ t.status }}</span></td>
+  <td class="muted">{{ t.updated }}</td>
+  <td><a class="btn grey" href="{{ url_for('ticket_view', ticket_id=t.id) }}">Open</a></td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No tickets yet.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+TICKET_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticket — MR X Bot Hosting</title>""" + CSS + V4_BADGE_CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap" style="max-width:820px">
+<p><a class="btn grey" href="{{ back_url }}">← All Tickets</a></p>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>🎫 {{ t.subject|e }} <span class="badge t{{ t.status }}">{{ t.status }}</span></h2>
+{% for m in t.messages %}
+<div style="border-left:3px solid {{ '#d4af37' if m.sender == 'admin' else '#35d3f7' }};
+            padding:10px 16px;margin-bottom:14px;background:rgba(255,255,255,.03);border-radius:0 10px 10px 0">
+  <div class="muted">{{ '🛠️ Support' if m.sender == 'admin' else '🧑 ' + t.username }} · {{ m.when }}</div>
+  <div style="font-size:16.5px;white-space:pre-wrap">{{ m.text|e }}</div>
+</div>
+{% endfor %}
+{% if t.status != 'closed' %}
+<form method="post" action="{{ reply_url }}">
+  <label>Your reply</label>
+  <textarea name="message" required style="min-height:80px"></textarea>
+  <button type="submit">Send Reply</button>
+</form>
+<form class="inline" method="post" action="{{ close_url }}" style="margin-top:10px"
+      onsubmit="return confirm('Close this ticket?')">
+  <button class="grey" type="submit">Close Ticket</button></form>
+{% else %}
+<p class="muted">This ticket is closed. Open a new ticket if you need more help.</p>
+{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+API_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Access — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap" style="max-width:820px">
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>🔌 Your API Key</h2>
+{% if new_key %}
+<p class="muted" style="font-size:15px">✅ New key generated — <b style="color:#eee">copy it
+now, it is shown only once</b>. Any old key stops working immediately.</p>
+<div class="keybox">{{ new_key }}</div>
+{% elif has_key %}
+<p class="muted" style="font-size:15px">You have an active API key (hidden for safety).
+Generate a new one if you lost it — the old one stops working.</p>
+{% else %}
+<p class="muted" style="font-size:15px">You don't have an API key yet. Generate one to
+control your bots from your own scripts.</p>
+{% endif %}
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+<form class="inline" method="post" action="{{ url_for('api_key_generate') }}">
+  <button type="submit">{{ 'Regenerate Key' if has_key else 'Generate API Key' }}</button></form>
+{% if has_key %}
+<form class="inline" method="post" action="{{ url_for('api_key_revoke') }}"
+      onsubmit="return confirm('Revoke your API key? Scripts using it will stop working.')">
+  <button class="red" type="submit">Revoke Key</button></form>
+{% endif %}
+</div>
+</div>
+<div class="card">
+<h2>📖 API Guide</h2>
+<p class="muted" style="font-size:15px">Send your key in the
+<b style="color:#eee">X-API-Key</b> header (or as <b style="color:#eee">Authorization: Bearer KEY</b>).
+Base URL: <code class="key">{{ base_url }}</code></p>
+<table>
+<tr><th>Endpoint</th><th>What it does</th></tr>
+<tr><td><code class="key">GET /api/v1/my/bots</code></td><td>List your bots with id, name, status, uptime, restarts, crashes</td></tr>
+<tr><td><code class="key">POST /api/v1/my/bots/&lt;id&gt;/start</code></td><td>Start one of your bots</td></tr>
+<tr><td><code class="key">POST /api/v1/my/bots/&lt;id&gt;/stop</code></td><td>Stop one of your bots</td></tr>
+</table>
+<p class="muted" style="font-size:15px;margin-top:14px">Example (Python):</p>
+<div class="keybox">import requests
+r = requests.get("{{ base_url }}/api/v1/my/bots",
+                 headers={"X-API-Key": "YOUR_KEY"})
+print(r.json())</div>
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+STATUS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status — MR X Bot Hosting</title>""" + CSS + """</head><body>
+<main><div class="wrap" style="max-width:760px">
+<div class="hud-rings"><span></span><span></span><span></span><div class="core"></div></div>
+<div class="card" style="text-align:center">
+<h2 style="font-size:26px">🟢 ALL SYSTEMS ONLINE</h2>
+<p class="muted" style="font-size:16px">MR X Bot Hosting panel is up and running.</p>
+<div class="stats" style="text-align:center">
+  <div class="stat"><div class="num">{{ running }}</div><div class="lbl">Bots Running Now</div></div>
+  <div class="stat"><div class="num">{{ total_bots }}</div><div class="lbl">Total Bots Hosted</div></div>
+  <div class="stat"><div class="num">{{ uptime }}</div><div class="lbl">Panel Uptime</div></div>
+</div>
+<p class="muted">Panel online since {{ started }} · <a href="{{ url_for('home') }}">MR X Bot Hosting</a></p>
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+ADMIN_ANALYTICS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Analytics — MR X Bot Hosting</title>""" + CSS + V4_BADGE_CSS + """</head><body>
+""" + ADMIN_NAV + """
+<main><div class="wrap">
+<h2 style="font-size:26px">📈 Analytics</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="stats">
+  <div class="stat"><div class="num">{{ s.users }}</div><div class="lbl">Total Users</div></div>
+  <div class="stat"><div class="num">{{ s.premium_users }}</div><div class="lbl">Premium Users</div></div>
+  <div class="stat"><div class="num">{{ s.bots }}</div><div class="lbl">Total Bots</div></div>
+  <div class="stat"><div class="num">{{ s.running }}</div><div class="lbl">Running Now</div></div>
+  <div class="stat"><div class="num">{{ s.keys_redeemed }}</div><div class="lbl">Keys Redeemed</div></div>
+  <div class="stat"><div class="num">{{ s.new_users_7d }}</div><div class="lbl">New Users (7d)</div></div>
+  <div class="stat"><div class="num">{{ s.tickets_open }}</div><div class="lbl">Open Tickets</div></div>
+  <div class="stat"><div class="num">Rs. {{ s.revenue_month }}</div><div class="lbl">Revenue This Month</div></div>
+</div>
+
+<div class="card">
+<h2>Bots by Status</h2>
+<table>
+{% for b in bars_status %}
+<tr><td style="width:170px">{{ b.label }}</td>
+<td><div class="abar"><div style="width:{{ b.pct }}%"></div></div></td>
+<td style="width:60px"><b>{{ b.value }}</b></td></tr>
+{% endfor %}
+</table>
+</div>
+
+<div class="card">
+<h2>Users &amp; Keys</h2>
+<table>
+{% for b in bars_mix %}
+<tr><td style="width:170px">{{ b.label }}</td>
+<td><div class="abar gold"><div style="width:{{ b.pct }}%"></div></div></td>
+<td style="width:60px"><b>{{ b.value }}</b></td></tr>
+{% endfor %}
+</table>
+</div>
+
+<div class="card">
+<h2>Top Bot Owners</h2>
+<table>
+{% for b in bars_owners %}
+<tr><td style="width:170px">{{ b.label|e }}</td>
+<td><div class="abar"><div style="width:{{ b.pct }}%"></div></div></td>
+<td style="width:60px"><b>{{ b.value }}</b></td></tr>
+{% endfor %}
+</table>
+</div>
+
+<div class="card">
+<h2>Per-Bot Performance</h2>
+{% if bots %}
+<div class="tablewrap"><table>
+<tr><th>Bot</th><th>Owner</th><th>Status</th><th>Uptime %</th><th>Total Runtime</th><th>This Run</th><th>Restarts</th><th>Crashes</th></tr>
+{% for b in bots %}
+<tr>
+  <td><b>{{ b.name|e }}</b></td>
+  <td>{{ b.owner_name|e }}</td>
+  <td><span class="badge {{ b.status }}">{{ b.status }}</span></td>
+  <td>{{ b.uptime_pct }}%</td>
+  <td>{{ b.total_runtime }}</td>
+  <td>{{ b.uptime }}</td>
+  <td>{{ b.restart_count }}</td>
+  <td>{{ b.crash_count }}</td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No bots yet.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+ADMIN_PROMOS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Promos — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + ADMIN_NAV + """
+<main><div class="wrap">
+<h2 style="font-size:26px">🏷️ Promo Codes</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+<h2>Create a Promo Code</h2>
+<p class="muted" style="font-size:15px">Users redeem promo codes on their My Keys page.
+Each user can use a code once. Max uses 0 = unlimited users.</p>
+<form method="post" action="{{ url_for('admin_promo_create') }}">
+  <label>Code (letters/numbers, e.g. LAUNCH50)</label>
+  <input type="text" name="code" required style="font-family:Consolas,monospace;text-transform:uppercase">
+  <label>Premium days granted</label>
+  <input type="number" name="days" value="7" min="1" max="3650" required>
+  <label>Max total uses (0 = unlimited)</label>
+  <input type="number" name="max_uses" value="0" min="0" max="100000">
+  <button type="submit" style="padding:12px 28px">Create Promo</button>
+</form>
+</div>
+<div class="card">
+<h2>All Promo Codes ({{ promos|length }})</h2>
+{% if promos %}
+<div class="tablewrap"><table>
+<tr><th>Code</th><th>Days</th><th>Used</th><th>Max Uses</th><th>Created</th><th>Action</th></tr>
+{% for p in promos %}
+<tr>
+  <td><code class="key">{{ p.code }}</code></td>
+  <td>{{ p.days }} days</td>
+  <td>{{ p.used_count }}</td>
+  <td>{{ p.max_label }}</td>
+  <td>{{ p.created }}</td>
+  <td>
+    <form class="inline" method="post" action="{{ url_for('admin_promo_delete', code=p.code) }}"
+          onsubmit="return confirm('Delete this promo code?')">
+      <button class="red" type="submit">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No promo codes yet.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+ADMIN_PAYMENTS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Payments — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + ADMIN_NAV + """
+<main><div class="wrap">
+<h2 style="font-size:26px">💰 Payment Records</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="stats">
+  <div class="stat"><div class="num">Rs. {{ month_total }}</div><div class="lbl">Revenue This Month</div></div>
+  <div class="stat"><div class="num">Rs. {{ all_total }}</div><div class="lbl">Revenue All Time</div></div>
+  <div class="stat"><div class="num">{{ payments|length }}</div><div class="lbl">Payments Recorded</div></div>
+</div>
+<div class="card">
+<h2>Log a Payment</h2>
+<p class="muted" style="font-size:15px">Record manual payments (JazzCash / EasyPaisa)
+when you sell a key, so your revenue stays tracked.</p>
+<form method="post" action="{{ url_for('admin_payment_add') }}">
+  <label>Customer username</label>
+  <input type="text" name="username" placeholder="e.g. ahmed123" required>
+  <label>Amount (Rs.)</label>
+  <input type="number" name="amount" min="1" max="10000000" required>
+  <label>Plan sold</label>
+  <input type="text" name="plan" placeholder="e.g. Premium 30 Days" required>
+  <label>Date (leave empty for today)</label>
+  <input type="text" name="date" placeholder="YYYY-MM-DD" pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}">
+  <label>Note (optional — e.g. JazzCash TID)</label>
+  <input type="text" name="note" placeholder="Optional">
+  <button type="submit" style="padding:12px 28px">Save Payment</button>
+</form>
+</div>
+<div class="card">
+<h2>All Payments</h2>
+{% if payments %}
+<div class="tablewrap"><table>
+<tr><th>Date</th><th>Customer</th><th>Plan</th><th>Amount</th><th>Note</th><th>Action</th></tr>
+{% for p in payments %}
+<tr>
+  <td>{{ p.date }}</td>
+  <td>@{{ p.username|e }}</td>
+  <td>{{ p.plan|e }}</td>
+  <td><b>Rs. {{ p.amount }}</b></td>
+  <td class="muted">{{ p.note|e }}</td>
+  <td>
+    <form class="inline" method="post" action="{{ url_for('admin_payment_delete', payment_id=p.id) }}"
+          onsubmit="return confirm('Delete this payment record?')">
+      <button class="red" type="submit">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No payments recorded yet.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+ADMIN_TICKETS_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Tickets — MR X Bot Hosting</title>""" + CSS + V4_BADGE_CSS + """</head><body>
+""" + ADMIN_NAV + """
+<main><div class="wrap">
+<h2 style="font-size:26px">🎫 Support Tickets ({{ tickets|length }})</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+{% if tickets %}
+<div class="tablewrap"><table>
+<tr><th>Subject</th><th>User</th><th>Status</th><th>Updated</th><th></th></tr>
+{% for t in tickets %}
+<tr>
+  <td><b>{{ t.subject|e }}</b></td>
+  <td>@{{ t.username|e }}</td>
+  <td><span class="badge t{{ t.status }}">{{ t.status }}</span></td>
+  <td class="muted">{{ t.updated }}</td>
+  <td><a class="btn grey" href="{{ url_for('admin_ticket_view', ticket_id=t.id) }}">Open</a></td>
+</tr>
+{% endfor %}
+</table></div>
+{% else %}<p class="muted">No tickets yet.</p>{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+
+# --------------------------------------------------------------------------
+# v4 routes — templates & GitHub deploy
+# --------------------------------------------------------------------------
+@app.route("/templates")
+@login_required
+def templates_page():
+    rows = []
+    for key, t in TEMPLATES.items():
+        row = dict(t)
+        row["key"] = key
+        rows.append(row)
+    return render_template_string(TEMPLATES_HTML, templates=rows,
+                                  flash=pop_flash())
+
+
+@app.route("/templates/<key>/deploy", methods=["POST"])
+@login_required
+def template_deploy(key):
+    tpl = TEMPLATES.get(key)
+    if tpl is None:
+        abort(404)
+    owner, err = _check_bot_quota()
+    if err is not None:
+        return err
+    name = (request.form.get("name") or tpl["name"]).strip()[:80]
+    token = (request.form.get("token") or "").strip()
+    if not token:
+        flash("Paste the bot token from @BotFather first.", "err")
+        return redirect(url_for("templates_page"))
+    bot_id = _new_bot_id()
+    os.makedirs(bot_dir(bot_id), exist_ok=True)
+    with open(os.path.join(bot_dir(bot_id), "bot.py"), "w") as f:
+        f.write(tpl["code"])
+    _register_bot(bot_id, owner, name, "bot.py", "py", token, False)
+    _log_line(bot_id, "[panel] deployed from template '%s'" % tpl["name"])
+    flash("Template bot '%s' deployed. Press Start to run it." % name)
+    return _after_action()
+
+
+@app.route("/deploy-github", methods=["GET", "POST"])
+@login_required
+def deploy_github():
+    error = None
+    if request.method == "POST":
+        owner, err = _check_bot_quota()
+        if err is not None:
+            return err
+        name = (request.form.get("name") or "").strip()[:80]
+        repo = (request.form.get("repo") or "").strip()
+        token = (request.form.get("token") or "").strip()
+        auto_restart = bool(request.form.get("auto_restart"))
+        m = re.match(r"^https://github\.com/([A-Za-z0-9_.-]+)/"
+                     r"([A-Za-z0-9_.-]+?)(?:\.git)?/?$", repo)
+        if not name:
+            error = "Give the bot a name."
+        elif not m:
+            error = ("That doesn't look like a public GitHub repo URL. "
+                     "Use https://github.com/username/repo")
+        elif shutil.which("git") is None:
+            error = "git is not available on this server, so GitHub " \
+                    "deploy is disabled. Upload a .zip of the repo instead."
+        else:
+            bot_id = _new_bot_id()
+            os.makedirs(bot_dir(bot_id), exist_ok=True)
+            dest = os.path.join(bot_dir(bot_id), "project")
+            env = dict(os.environ)
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            try:
+                proc = subprocess.run(
+                    ["git", "clone", "--depth", "1", "--", repo, dest],
+                    capture_output=True, text=True, timeout=180, env=env)
+            except subprocess.TimeoutExpired:
+                proc = None
+                error = "Cloning took too long (>180s) and was stopped."
+            except OSError as e:
+                proc = None
+                error = "Could not run git: %s" % e
+            if proc is not None and proc.returncode != 0:
+                tail = (proc.stderr or "").strip().splitlines()
+                error = ("Could not clone that repository (%s). It must "
+                         "exist and be public."
+                         % (tail[-1][:160] if tail else "git error"))
+            if error:
+                shutil.rmtree(bot_dir(bot_id), ignore_errors=True)
+            else:
+                entry = _find_entry_file(dest)
+                if entry is None:
+                    shutil.rmtree(bot_dir(bot_id), ignore_errors=True)
+                    error = ("No Python entry file found in that repo. "
+                             "Add a main.py (or bot.py / app.py / run.py) "
+                             "and try again.")
+                else:
+                    entry_rel = os.path.join("project", entry)
+                    _register_bot(bot_id, owner, name, entry_rel, "zip",
+                                  token, auto_restart)
+                    _log_line(bot_id, "[panel] cloned from GitHub: %s" % repo)
+                    install_requirements(bot_id, entry_rel)
+                    flash("Bot '%s' deployed from GitHub. Press Start to "
+                          "run it." % name)
+                    return _after_action()
+    return render_template_string(GITHUB_HTML, error=error, flash=pop_flash())
+
+
+# --------------------------------------------------------------------------
+# v4 routes — file manager, web console, scheduled restart
+# --------------------------------------------------------------------------
+@app.route("/bot/<bot_id>/files")
+@login_required
+def bot_files(bot_id):
+    bot = _bot_or_404(bot_id)
+    back_url = url_for("admin_bots") if is_admin() else url_for("dashboard")
+    return render_template_string(FILES_HTML, bot=bot,
+                                  files=_list_bot_files(bot_id),
+                                  back_url=back_url, flash=pop_flash())
+
+
+@app.route("/bot/<bot_id>/files/view")
+@login_required
+def bot_file_view(bot_id):
+    bot = _bot_or_404(bot_id)
+    rel = request.args.get("path") or ""
+    target = _safe_bot_path(bot_id, rel)
+    if target is None or not os.path.isfile(target):
+        abort(404)
+    if os.path.splitext(target)[1].lower() not in _EDITABLE_EXTS \
+            or os.path.getsize(target) > _MAX_EDIT_BYTES:
+        flash("That file can't be edited in the browser (binary or too "
+              "big). Download the bot to edit it locally.", "err")
+        return redirect(url_for("bot_files", bot_id=bot_id))
+    with open(target, errors="replace") as f:
+        content = f.read()
+    return render_template_string(FILE_EDIT_HTML, bot=bot, path=rel,
+                                  content=content, flash=pop_flash())
+
+
+@app.route("/bot/<bot_id>/files/save", methods=["POST"])
+@login_required
+def bot_file_save(bot_id):
+    _bot_or_404(bot_id)
+    rel = request.form.get("path") or ""
+    target = _safe_bot_path(bot_id, rel)
+    if target is None or not os.path.isfile(target):
+        abort(404)
+    content = request.form.get("content") or ""
+    if len(content.encode("utf-8", "ignore")) > _MAX_EDIT_BYTES:
+        flash("File too big to save from the browser (max 512 KB).", "err")
+        return redirect(url_for("bot_files", bot_id=bot_id))
+    with open(target, "w") as f:
+        f.write(content)
+    _log_line(bot_id, "[panel] file edited from panel: %s" % rel)
+    flash("File saved. Restart the bot to run the new code.")
+    return redirect(url_for("bot_file_view", bot_id=bot_id, path=rel))
+
+
+@app.route("/bot/<bot_id>/files/delete", methods=["POST"])
+@login_required
+def bot_file_delete(bot_id):
+    bot = _bot_or_404(bot_id)
+    rel = request.form.get("path") or ""
+    target = _safe_bot_path(bot_id, rel)
+    if target is None or not os.path.isfile(target):
+        abort(404)
+    if os.path.realpath(target) == os.path.realpath(
+            os.path.join(bot_dir(bot_id), bot["file"])):
+        flash("That's the bot's entry file — replace the bot instead of "
+              "deleting its main file.", "err")
+        return redirect(url_for("bot_files", bot_id=bot_id))
+    try:
+        os.remove(target)
+    except OSError as e:
+        flash("Could not delete the file: %s" % e, "err")
+        return redirect(url_for("bot_files", bot_id=bot_id))
+    _log_line(bot_id, "[panel] file deleted from panel: %s" % rel)
+    flash("File deleted: %s" % rel)
+    return redirect(url_for("bot_files", bot_id=bot_id))
+
+
+@app.route("/bot/<bot_id>/console", methods=["POST"])
+@login_required
+def bot_console(bot_id):
+    _bot_or_404(bot_id)
+    line = request.form.get("line") or ""
+    with _proc_lock:
+        entry = _processes.get(bot_id)
+    sent = False
+    if entry and entry["proc"].poll() is None and entry["proc"].stdin:
+        try:
+            entry["proc"].stdin.write((line + "\n").encode())
+            entry["proc"].stdin.flush()
+            sent = True
+        except (OSError, ValueError):
+            sent = False
+    if sent:
+        _log_line(bot_id, "[console] > %s" % line)
+        flash("Sent to the bot's console: %s" % line)
+    else:
+        flash("Bot is not running (or doesn't accept console input).",
+              "err")
+    return redirect(url_for("logs", bot_id=bot_id))
+
+
+@app.route("/bot/<bot_id>/schedule", methods=["POST"])
+@login_required
+def bot_schedule(bot_id):
+    _bot_or_404(bot_id)
+    mode = (request.form.get("sched_mode") or "off").strip()
+    if mode not in ("off", "daily", "interval"):
+        mode = "off"
+    sched_time = (request.form.get("sched_time") or "").strip()
+    if mode == "daily" and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$",
+                                        sched_time):
+        flash("For daily mode, enter a valid time like 04:00.", "err")
+        return redirect(url_for("edit_bot", bot_id=bot_id))
+    try:
+        hours = int(request.form.get("sched_hours") or 24)
+    except ValueError:
+        hours = 24
+    hours = max(1, min(720, hours))
+    update_bot(bot_id, sched_mode=mode, sched_time=sched_time,
+               sched_hours=hours, last_sched_restart=int(time.time()))
+    flash("Scheduled restart saved (%s)." % mode)
+    return redirect(url_for("edit_bot", bot_id=bot_id))
+
+
+# --------------------------------------------------------------------------
+# v4 routes — promo codes (user redeem)
+# --------------------------------------------------------------------------
+@app.route("/promo/redeem", methods=["POST"])
+@user_required
+def redeem_promo():
+    user = current_user()
+    code = (request.form.get("code") or "").strip().upper()
+    with _store_lock:
+        data = load_promos()
+        rec = None
+        for p in data["promos"]:
+            if p["code"] == code:
+                rec = p
+                break
+        if rec is None:
+            flash("Invalid promo code. Check it and try again.", "err")
+            return redirect(url_for("my_keys"))
+        used_by = rec.get("used_by") or []
+        if any(u.get("user") == user["id"] for u in used_by):
+            flash("You have already used this promo code.", "err")
+            return redirect(url_for("my_keys"))
+        max_uses = int(rec.get("max_uses") or 0)
+        if max_uses and len(used_by) >= max_uses:
+            flash("This promo code has reached its usage limit.", "err")
+            return redirect(url_for("my_keys"))
+        now = int(time.time())
+        base = max(now, int(user.get("premium_until") or 0))
+        new_expiry = base + int(rec["days"]) * 86400
+        users = load_users()
+        for u in users["users"]:
+            if u["id"] == user["id"]:
+                u["premium_until"] = new_expiry
+        save_users(users)
+        used_by.append({"user": user["id"], "username": user["username"],
+                        "ts": now})
+        rec["used_by"] = used_by
+        save_promos(data)
+    _credit_referrer(user)
+    flash("🎉 Promo applied! Premium is now active until %s."
+          % fmt_date(new_expiry))
+    return redirect(url_for("my_keys"))
+
+
+# --------------------------------------------------------------------------
+# v4 routes — support tickets (user + admin)
+# --------------------------------------------------------------------------
+def _ticket_view_model(t):
+    row = dict(t)
+    row["updated"] = fmt_datetime(t.get("updated"))
+    row["messages"] = [dict(m, when=fmt_datetime(m.get("ts")))
+                       for m in t.get("messages") or []]
+    return row
+
+
+@app.route("/tickets", methods=["GET", "POST"])
+@user_required
+def tickets():
+    user = current_user()
+    if request.method == "POST":
+        subject = (request.form.get("subject") or "").strip()[:120]
+        message = (request.form.get("message") or "").strip()[:4000]
+        if not subject or not message:
+            flash("Subject and message are both required.", "err")
+            return redirect(url_for("tickets"))
+        now = int(time.time())
+        with _store_lock:
+            data = load_tickets()
+            data["tickets"].append({
+                "id": secrets.token_hex(5),
+                "user_id": user["id"],
+                "username": user["username"],
+                "subject": subject,
+                "status": "open",
+                "created": now,
+                "updated": now,
+                "messages": [{"sender": "user", "text": message, "ts": now}],
+            })
+            save_tickets(data)
+        flash("Ticket opened. We usually reply within a day.")
+        return redirect(url_for("tickets"))
+    rows = [_ticket_view_model(t) for t in load_tickets()["tickets"]
+            if t.get("user_id") == user["id"]]
+    rows.sort(key=lambda r: r.get("updated") or "", reverse=True)
+    return render_template_string(TICKETS_HTML, tickets=rows,
+                                  flash=pop_flash())
+
+
+def _get_ticket_or_404(ticket_id, own_only_user=None):
+    for t in load_tickets()["tickets"]:
+        if t["id"] == ticket_id:
+            if own_only_user is not None \
+                    and t.get("user_id") != own_only_user["id"]:
+                abort(404)
+            return t
+    abort(404)
+
+
+def _ticket_add_message(ticket_id, sender, text):
+    now = int(time.time())
+    with _store_lock:
+        data = load_tickets()
+        for t in data["tickets"]:
+            if t["id"] == ticket_id:
+                t.setdefault("messages", []).append(
+                    {"sender": sender, "text": text, "ts": now})
+                t["updated"] = now
+                if sender == "admin":
+                    t["status"] = "ans"
+                elif t["status"] == "closed":
+                    t["status"] = "open"
+                save_tickets(data)
+                return t
+    return None
+
+
+@app.route("/tickets/<ticket_id>")
+@user_required
+def ticket_view(ticket_id):
+    user = current_user()
+    t = _ticket_view_model(_get_ticket_or_404(ticket_id, user))
+    return render_template_string(
+        TICKET_HTML, t=t, back_url=url_for("tickets"),
+        reply_url=url_for("ticket_reply", ticket_id=ticket_id),
+        close_url=url_for("ticket_close", ticket_id=ticket_id),
+        flash=pop_flash())
+
+
+@app.route("/tickets/<ticket_id>/reply", methods=["POST"])
+@user_required
+def ticket_reply(ticket_id):
+    user = current_user()
+    _get_ticket_or_404(ticket_id, user)
+    text = (request.form.get("message") or "").strip()[:4000]
+    if text:
+        _ticket_add_message(ticket_id, "user", text)
+        flash("Reply sent.")
+    return redirect(url_for("ticket_view", ticket_id=ticket_id))
+
+
+@app.route("/tickets/<ticket_id>/close", methods=["POST"])
+@login_required
+def ticket_close(ticket_id):
+    if is_admin():
+        _get_ticket_or_404(ticket_id)
+        back = url_for("admin_ticket_view", ticket_id=ticket_id)
+    else:
+        user = current_user()
+        if user is None:
+            return redirect(url_for("login"))
+        _get_ticket_or_404(ticket_id, user)
+        back = url_for("ticket_view", ticket_id=ticket_id)
+    with _store_lock:
+        data = load_tickets()
+        for t in data["tickets"]:
+            if t["id"] == ticket_id:
+                t["status"] = "closed"
+                t["updated"] = int(time.time())
+        save_tickets(data)
+    flash("Ticket closed.")
+    return redirect(back)
+
+
+@app.route("/admin/tickets")
+@admin_required
+def admin_tickets():
+    rows = [_ticket_view_model(t) for t in load_tickets()["tickets"]]
+    rows.sort(key=lambda r: (r["status"] == "closed", r.get("updated") or ""),
+              reverse=False)
+    rows.sort(key=lambda r: r.get("updated") or "", reverse=True)
+    rows.sort(key=lambda r: 0 if r["status"] == "open" else
+              (1 if r["status"] == "ans" else 2))
+    return render_template_string(ADMIN_TICKETS_HTML, tickets=rows,
+                                  flash=pop_flash())
+
+
+@app.route("/admin/tickets/<ticket_id>")
+@admin_required
+def admin_ticket_view(ticket_id):
+    t = _ticket_view_model(_get_ticket_or_404(ticket_id))
+    return render_template_string(
+        TICKET_HTML, t=t, back_url=url_for("admin_tickets"),
+        reply_url=url_for("admin_ticket_reply", ticket_id=ticket_id),
+        close_url=url_for("ticket_close", ticket_id=ticket_id),
+        flash=pop_flash())
+
+
+@app.route("/admin/tickets/<ticket_id>/reply", methods=["POST"])
+@admin_required
+def admin_ticket_reply(ticket_id):
+    t = _get_ticket_or_404(ticket_id)
+    text = (request.form.get("message") or "").strip()[:4000]
+    if text:
+        _ticket_add_message(ticket_id, "admin", text)
+        notify(t["user_id"], "ticket",
+               "🎫 Support replied to your ticket '%s'." % t["subject"])
+        flash("Reply sent to the user.")
+    return redirect(url_for("admin_ticket_view", ticket_id=ticket_id))
+
+
+# --------------------------------------------------------------------------
+# v4 routes — notifications, backups, status page
+# --------------------------------------------------------------------------
+@app.route("/notifications")
+@user_required
+def notifications():
+    user = current_user()
+    seen_before = int(user.get("notif_seen_ts") or 0)
+    rows = []
+    for n in load_notifications()["notes"]:
+        if n.get("user_id") == user["id"]:
+            rows.append(dict(n, when=fmt_datetime(n.get("ts")),
+                             fresh=not n.get("read")))
+        elif n.get("user_id") == "all":
+            rows.append(dict(n, when=fmt_datetime(n.get("ts")),
+                             fresh=int(n.get("ts") or 0) > seen_before))
+    rows.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    rows = rows[:60]
+    with _store_lock:
+        data = load_notifications()
+        for n in data["notes"]:
+            if n.get("user_id") == user["id"]:
+                n["read"] = True
+        save_notifications(data)
+        users = load_users()
+        for u in users["users"]:
+            if u["id"] == user["id"]:
+                u["notif_seen_ts"] = int(time.time())
+        save_users(users)
+    return render_template_string(NOTIF_HTML, notes=rows)
+
+
+@app.route("/backup/my-bots")
+@user_required
+def backup_my_bots():
+    user = current_user()
+    bots = user_bots(user["id"])
+    buf = io.BytesIO()
+    manifest = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for bot in bots:
+            manifest.append({k: bot.get(k) for k in
+                             ("id", "name", "file", "kind", "created",
+                              "token_masked")})
+            bdir = bot_dir(bot["id"])
+            for dirpath, dirnames, filenames in os.walk(bdir):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for fn in filenames:
+                    if fn == "config.env":
+                        continue  # tokens are never included in downloads
+                    full = os.path.join(dirpath, fn)
+                    arc = os.path.join(bot["id"],
+                                       os.path.relpath(full, bdir))
+                    z.write(full, arc)
+        z.writestr("manifest.json", json.dumps(
+            {"user": user["username"], "exported": int(time.time()),
+             "bots": manifest}, indent=2))
+        z.writestr("README.txt",
+                   "MR X Bot Hosting backup\n"
+                   "Bot tokens (config.env) are NOT included, by design.\n"
+                   "Re-add each bot in the panel and paste its token "
+                   "again to restore.\n")
+    buf.seek(0)
+    return send_file(buf, as_attachment=True,
+                     download_name="mrx-my-bots-backup.zip",
+                     mimetype="application/zip")
+
+
+@app.route("/admin/backup")
+@admin_required
+def admin_backup():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fname in ("bots.json", "users.json", "keys.json",
+                      "settings.json", "promos.json", "tickets.json",
+                      "notifications.json", "payments.json"):
+            path = os.path.join(DATA_DIR, fname)
+            if os.path.exists(path):
+                z.write(path, os.path.join("data", fname))
+        for bot in load_db()["bots"]:
+            bdir = bot_dir(bot["id"])
+            for dirpath, dirnames, filenames in os.walk(bdir):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for fn in filenames:
+                    if fn == "config.env":
+                        continue  # tokens excluded, same rule as v3
+                    full = os.path.join(dirpath, fn)
+                    arc = os.path.join("data", "bots", bot["id"],
+                                       os.path.relpath(full, bdir))
+                    z.write(full, arc)
+        z.writestr("BACKUP-README.txt",
+                   "MR X Bot Hosting — full admin backup\n"
+                   "Contains panel data (users incl. password hashes, "
+                   "keys, settings, promos, tickets, payments) and all "
+                   "bot files.\nBot tokens (config.env) and the Flask "
+                   "secret.key are NOT included, by design — keep this "
+                   "file private anyway.\n")
+    buf.seek(0)
+    return send_file(buf, as_attachment=True,
+                     download_name="mrx-full-backup.zip",
+                     mimetype="application/zip")
+
+
+@app.route("/status")
+def status_page():
+    bots = load_db()["bots"]
+    running = sum(1 for b in bots if bot_status(b) == "running")
+    return render_template_string(
+        STATUS_HTML, running=running, total_bots=len(bots),
+        uptime=fmt_duration(time.time() - PANEL_STARTED),
+        started=fmt_datetime(int(PANEL_STARTED)))
+
+
+# --------------------------------------------------------------------------
+# v4 routes — user API keys + REST API
+# --------------------------------------------------------------------------
+def _hash_api_key(key):
+    import hashlib
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _api_user():
+    key = request.headers.get("X-API-Key") or ""
+    if not key:
+        auth = request.headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            key = auth[len("Bearer "):].strip()
+    if not key:
+        return None
+    digest = _hash_api_key(key)
+    for u in load_users()["users"]:
+        if u.get("api_key_hash") and \
+                secrets.compare_digest(u["api_key_hash"], digest):
+            if u.get("banned"):
+                return None
+            return u
+    return None
+
+
+@app.route("/api")
+@user_required
+def api_page():
+    user = current_user()
+    new_key = session.pop("new_api_key", None)
+    return render_template_string(
+        API_HTML, has_key=bool(user.get("api_key_hash")), new_key=new_key,
+        base_url=request.host_url.rstrip("/"), flash=pop_flash())
+
+
+@app.route("/api/key/generate", methods=["POST"])
+@user_required
+def api_key_generate():
+    user = current_user()
+    plain = "mrx_" + secrets.token_urlsafe(24)
+    with _store_lock:
+        data = load_users()
+        for u in data["users"]:
+            if u["id"] == user["id"]:
+                u["api_key_hash"] = _hash_api_key(plain)
+        save_users(data)
+    session["new_api_key"] = plain
+    return redirect(url_for("api_page"))
+
+
+@app.route("/api/key/revoke", methods=["POST"])
+@user_required
+def api_key_revoke():
+    user = current_user()
+    with _store_lock:
+        data = load_users()
+        for u in data["users"]:
+            if u["id"] == user["id"]:
+                u.pop("api_key_hash", None)
+        save_users(data)
+    flash("API key revoked.")
+    return redirect(url_for("api_page"))
+
+
+@app.route("/api/v1/my/bots")
+def api_v1_bots():
+    user = _api_user()
+    if user is None:
+        return jsonify({"error": "invalid or missing API key"}), 401
+    out = []
+    for bot in user_bots(user["id"]):
+        out.append({
+            "id": bot["id"],
+            "name": bot["name"],
+            "status": bot_status(bot),
+            "uptime": bot_uptime(bot),
+            "uptime_pct": bot_uptime_pct(bot),
+            "restarts": bot.get("restart_count") or 0,
+            "crashes": bot.get("crash_count") or 0,
+        })
+    return jsonify({"bots": out})
+
+
+@app.route("/api/v1/my/bots/<bot_id>/start", methods=["POST"])
+def api_v1_start(bot_id):
+    user = _api_user()
+    if user is None:
+        return jsonify({"error": "invalid or missing API key"}), 401
+    bot = get_bot(bot_id)
+    if bot is None or bot.get("owner") != user["id"]:
+        return jsonify({"error": "bot not found"}), 404
+    ok = start_bot(bot_id)
+    return jsonify({"ok": ok, "status": bot_status(get_bot(bot_id))})
+
+
+@app.route("/api/v1/my/bots/<bot_id>/stop", methods=["POST"])
+def api_v1_stop(bot_id):
+    user = _api_user()
+    if user is None:
+        return jsonify({"error": "invalid or missing API key"}), 401
+    bot = get_bot(bot_id)
+    if bot is None or bot.get("owner") != user["id"]:
+        return jsonify({"error": "bot not found"}), 404
+    stop_bot(bot_id)
+    return jsonify({"ok": True, "status": bot_status(get_bot(bot_id))})
+
+
+# --------------------------------------------------------------------------
+# v4 routes — admin analytics, promos, payments
+# --------------------------------------------------------------------------
+def _bars(pairs):
+    """[(label, value)] -> template rows with a % width for CSS bars."""
+    top = max([v for _l, v in pairs] + [1])
+    return [{"label": l, "value": v, "pct": int(round(v * 100.0 / top))}
+            for l, v in pairs]
+
+
+@app.route("/admin/analytics")
+@admin_required
+def admin_analytics():
+    users = load_users()["users"]
+    bots = load_db()["bots"]
+    keys = load_keys()["keys"]
+    payments = load_payments()["payments"]
+    now = int(time.time())
+    lt = time.localtime(now)
+    month_total = sum(int(p.get("amount") or 0) for p in payments
+                      if time.localtime(int(p.get("ts") or 0)).tm_year == lt.tm_year
+                      and time.localtime(int(p.get("ts") or 0)).tm_mon == lt.tm_mon)
+    status_counts = {"running": 0, "stopped": 0, "crashed": 0}
+    users_by_id = {u["id"]: u for u in users}
+    rows = []
+    owner_counts = {}
+    for bot in bots:
+        st = bot_status(bot)
+        status_counts[st] = status_counts.get(st, 0) + 1
+        owner = users_by_id.get(bot.get("owner") or "")
+        oname = ("@" + owner["username"]) if owner else "Admin (ownerless)"
+        owner_counts[oname] = owner_counts.get(oname, 0) + 1
+        b = dict(bot)
+        b["status"] = st
+        b["uptime"] = bot_uptime(bot)
+        b["uptime_pct"] = bot_uptime_pct(bot)
+        b["total_runtime"] = fmt_duration(bot.get("total_runtime"))
+        b["restart_count"] = bot.get("restart_count") or 0
+        b["crash_count"] = bot.get("crash_count") or 0
+        b["owner_name"] = oname
+        rows.append(b)
+    top_owners = sorted(owner_counts.items(), key=lambda kv: -kv[1])[:5]
+    stats = {
+        "users": len(users),
+        "premium_users": sum(1 for u in users if user_is_premium(u)),
+        "bots": len(bots),
+        "running": status_counts.get("running", 0),
+        "keys_redeemed": sum(1 for k in keys if k["status"] == "used"),
+        "new_users_7d": sum(1 for u in users
+                            if int(u.get("created") or 0) > now - 7 * 86400),
+        "tickets_open": sum(1 for t in load_tickets()["tickets"]
+                            if t.get("status") == "open"),
+        "revenue_month": month_total,
+    }
+    bars_status = _bars([("Running", status_counts.get("running", 0)),
+                         ("Stopped", status_counts.get("stopped", 0)),
+                         ("Crashed", status_counts.get("crashed", 0))])
+    bars_mix = _bars([
+        ("Premium users", stats["premium_users"]),
+        ("Free users", len(users) - stats["premium_users"]),
+        ("Keys used", stats["keys_redeemed"]),
+        ("Keys unused", sum(1 for k in keys if k["status"] == "unused")),
+        ("Keys revoked", sum(1 for k in keys if k["status"] == "revoked")),
+        ("Promo codes used", sum(len(p.get("used_by") or [])
+                                 for p in load_promos()["promos"])),
+    ])
+    return render_template_string(
+        ADMIN_ANALYTICS_HTML, s=stats, bots=rows, bars_status=bars_status,
+        bars_mix=bars_mix, bars_owners=_bars(top_owners),
+        flash=pop_flash())
+
+
+@app.route("/admin/promos")
+@admin_required
+def admin_promos():
+    rows = []
+    for p in load_promos()["promos"]:
+        row = dict(p)
+        row["used_count"] = len(p.get("used_by") or [])
+        row["max_label"] = str(p["max_uses"]) if p.get("max_uses") else "∞"
+        row["created"] = fmt_datetime(p.get("created"))
+        rows.append(row)
+    rows.reverse()
+    return render_template_string(ADMIN_PROMOS_HTML, promos=rows,
+                                  flash=pop_flash())
+
+
+@app.route("/admin/promos/create", methods=["POST"])
+@admin_required
+def admin_promo_create():
+    code = (request.form.get("code") or "").strip().upper()
+    try:
+        days = int(request.form.get("days") or 0)
+    except ValueError:
+        days = 0
+    try:
+        max_uses = int(request.form.get("max_uses") or 0)
+    except ValueError:
+        max_uses = 0
+    if not re.match(r"^[A-Z0-9_-]{3,32}$", code):
+        flash("Promo code must be 3–32 characters: A–Z, 0–9, - or _.", "err")
+        return redirect(url_for("admin_promos"))
+    if days < 1 or days > 3650:
+        flash("Days must be between 1 and 3650.", "err")
+        return redirect(url_for("admin_promos"))
+    with _store_lock:
+        data = load_promos()
+        if any(p["code"] == code for p in data["promos"]):
+            flash("That promo code already exists.", "err")
+            return redirect(url_for("admin_promos"))
+        data["promos"].append({
+            "code": code, "days": days, "max_uses": max(0, max_uses),
+            "created": int(time.time()), "used_by": [],
+        })
+        save_promos(data)
+    flash("Promo code %s created (%d days)." % (code, days))
+    return redirect(url_for("admin_promos"))
+
+
+@app.route("/admin/promos/<code>/delete", methods=["POST"])
+@admin_required
+def admin_promo_delete(code):
+    with _store_lock:
+        data = load_promos()
+        data["promos"] = [p for p in data["promos"] if p["code"] != code]
+        save_promos(data)
+    flash("Promo code %s deleted." % code)
+    return redirect(url_for("admin_promos"))
+
+
+@app.route("/admin/payments")
+@admin_required
+def admin_payments():
+    raw = load_payments()["payments"]
+    now = int(time.time())
+    lt = time.localtime(now)
+    month_total = 0
+    all_total = 0
+    rows = []
+    for p in raw:
+        amt = int(p.get("amount") or 0)
+        all_total += amt
+        pt = time.localtime(int(p.get("ts") or 0))
+        if pt.tm_year == lt.tm_year and pt.tm_mon == lt.tm_mon:
+            month_total += amt
+        row = dict(p)
+        row["date"] = fmt_date(p.get("ts"))
+        rows.append(row)
+    rows.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    return render_template_string(ADMIN_PAYMENTS_HTML, payments=rows,
+                                  month_total=month_total,
+                                  all_total=all_total, flash=pop_flash())
+
+
+@app.route("/admin/payments/add", methods=["POST"])
+@admin_required
+def admin_payment_add():
+    username = (request.form.get("username") or "").strip().lstrip("@")
+    plan = (request.form.get("plan") or "").strip()[:80]
+    note = (request.form.get("note") or "").strip()[:200]
+    try:
+        amount = int(request.form.get("amount") or 0)
+    except ValueError:
+        amount = 0
+    if not username or not plan or amount < 1:
+        flash("Username, plan and a valid amount are required.", "err")
+        return redirect(url_for("admin_payments"))
+    ts = int(time.time())
+    date_raw = (request.form.get("date") or "").strip()
+    if date_raw:
+        try:
+            ts = int(time.mktime(time.strptime(date_raw, "%Y-%m-%d")))
+        except ValueError:
+            flash("Date must look like YYYY-MM-DD.", "err")
+            return redirect(url_for("admin_payments"))
+    with _store_lock:
+        data = load_payments()
+        data["payments"].append({
+            "id": secrets.token_hex(5),
+            "username": username,
+            "amount": amount,
+            "plan": plan,
+            "note": note,
+            "ts": ts,
+        })
+        save_payments(data)
+    flash("Payment of Rs. %d from @%s recorded." % (amount, username))
+    return redirect(url_for("admin_payments"))
+
+
+@app.route("/admin/payments/<payment_id>/delete", methods=["POST"])
+@admin_required
+def admin_payment_delete(payment_id):
+    with _store_lock:
+        data = load_payments()
+        data["payments"] = [p for p in data["payments"]
+                            if p["id"] != payment_id]
+        save_payments(data)
+    flash("Payment record deleted.")
+    return redirect(url_for("admin_payments"))
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     print("=" * 56, flush=True)
-    print("  MR X BOT HOSTING PANEL v3", flush=True)
+    print("  MR X BOT HOSTING PANEL v4", flush=True)
     print("  Listening on port %d" % port, flush=True)
     print("  Admin login: username 'admin' + PANEL_PASSWORD", flush=True)
     if PASSWORD_GENERATED:
