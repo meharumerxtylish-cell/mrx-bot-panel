@@ -661,7 +661,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
         <li>Live logs</li>
         <li>Auto-restart option</li>
       </ul>
-      <a class="btn" href="{{ url_for('register') }}">Get a Key</a>
+      <a class="btn" target="_blank" rel="noopener" href="https://wa.me/923044507018?text=Assalam-o-Alaikum!%20I%20want%20to%20buy%20a%20Premium%20key%20(2%20Days%20-%20Rs.%2050)%20for%20MR%20X%20Bot%20Hosting.">Get a Key</a>
     </div>
     <div class="price-card premium">
       <div class="planname">Premium</div>
@@ -673,7 +673,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
         <li>Live logs</li>
         <li>Auto-restart option</li>
       </ul>
-      <a class="btn" href="{{ url_for('register') }}">Get a Key</a>
+      <a class="btn" target="_blank" rel="noopener" href="https://wa.me/923044507018?text=Assalam-o-Alaikum!%20I%20want%20to%20buy%20a%20Premium%20key%20(7%20Days%20-%20Rs.%20150)%20for%20MR%20X%20Bot%20Hosting.">Get a Key</a>
     </div>
     <div class="price-card premium">
       <div class="ribbon">MOST POPULAR</div>
@@ -687,7 +687,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
         <li>Auto-restart option</li>
         <li>Best value for serious sellers</li>
       </ul>
-      <a class="btn" href="{{ url_for('register') }}">Get a Key</a>
+      <a class="btn" target="_blank" rel="noopener" href="https://wa.me/923044507018?text=Assalam-o-Alaikum!%20I%20want%20to%20buy%20a%20Premium%20key%20(30%20Days%20-%20Rs.%20400)%20for%20MR%20X%20Bot%20Hosting.">Get a Key</a>
     </div>
   </div>
   <p class="muted" style="text-align:center;margin-top:22px">
@@ -785,6 +785,33 @@ DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 
 {% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+
+<div class="card">
+<h2>💎 Get Premium — Buy a Key</h2>
+<p class="muted" style="margin-top:0">Premium = <b style="color:#eee">Unlimited bots</b>. Pick a plan and tap
+<b style="color:#eee">Get a Key</b> — you will be taken straight to our WhatsApp to buy your key.</p>
+<div style="display:flex;gap:14px;flex-wrap:wrap">
+  <div style="flex:1;min-width:180px;background:#101010;border:1.5px solid #d4af37;border-radius:12px;padding:18px;text-align:center">
+    <div style="font-weight:800;letter-spacing:1.5px;color:#d4af37">PREMIUM · 2 DAYS</div>
+    <div style="font-size:32px;font-weight:800;margin:8px 0">Rs. 50</div>
+    <a class="btn" target="_blank" rel="noopener"
+       href="https://wa.me/923044507018?text={{ ('Assalam-o-Alaikum! I want to buy a Premium key (2 Days - Rs. 50) for MR X Bot Hosting. My username is: ' ~ user.username)|urlencode }}">Get a Key</a>
+  </div>
+  <div style="flex:1;min-width:180px;background:#101010;border:1.5px solid #d4af37;border-radius:12px;padding:18px;text-align:center">
+    <div style="font-weight:800;letter-spacing:1.5px;color:#d4af37">PREMIUM · 7 DAYS</div>
+    <div style="font-size:32px;font-weight:800;margin:8px 0">Rs. 150</div>
+    <a class="btn" target="_blank" rel="noopener"
+       href="https://wa.me/923044507018?text={{ ('Assalam-o-Alaikum! I want to buy a Premium key (7 Days - Rs. 150) for MR X Bot Hosting. My username is: ' ~ user.username)|urlencode }}">Get a Key</a>
+  </div>
+  <div style="flex:1;min-width:180px;background:#101010;border:1.5px solid #d4af37;border-radius:12px;padding:18px;text-align:center">
+    <div style="font-weight:800;letter-spacing:1.5px;color:#d4af37">PREMIUM · 30 DAYS</div>
+    <div style="font-size:32px;font-weight:800;margin:8px 0">Rs. 400</div>
+    <a class="btn" target="_blank" rel="noopener"
+       href="https://wa.me/923044507018?text={{ ('Assalam-o-Alaikum! I want to buy a Premium key (30 Days - Rs. 400) for MR X Bot Hosting. My username is: ' ~ user.username)|urlencode }}">Get a Key</a>
+  </div>
+</div>
+<p class="muted" style="margin-bottom:0">Already bought a key? Open <b>Redeem Key</b> in the menu and enter it — Premium activates instantly.</p>
+</div>
 
 <div class="card">
 <h2>My Bots ({{ bots|length }})</h2>
