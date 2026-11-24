@@ -653,8 +653,8 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
     </div>
     <div class="price-card premium">
       <div class="planname">Premium</div>
-      <div class="price">2 Days</div>
-      <div class="muted">with a license key</div>
+      <div class="price">Rs. 50</div>
+      <div class="muted">for 2 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 2 days</li>
         <li>Start / stop / restart</li>
@@ -665,8 +665,8 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
     </div>
     <div class="price-card premium">
       <div class="planname">Premium</div>
-      <div class="price">7 Days</div>
-      <div class="muted">with a license key</div>
+      <div class="price">Rs. 150</div>
+      <div class="muted">for 7 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 7 days</li>
         <li>Start / stop / restart</li>
@@ -678,8 +678,8 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
     <div class="price-card premium">
       <div class="ribbon">MOST POPULAR</div>
       <div class="planname">Premium</div>
-      <div class="price">30 Days</div>
-      <div class="muted">with a license key</div>
+      <div class="price">Rs. 400</div>
+      <div class="muted">for 30 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 30 days</li>
         <li>Start / stop / restart</li>
