@@ -10,6 +10,11 @@ A single-file Flask panel to host Telegram bots, now with:
 - License keys (MRX-XXXXXX-XXXXXX-XXXXXX) that activate Premium for a
   number of days. Users redeem keys in the panel.
 - An admin panel (stats, users, keys, all bots).
+- Website hosting: users create static sites (Free = 1, Premium =
+  unlimited — the same Premium key covers bots and websites), upload a
+  .zip or a single .html, and the site is served publicly at
+  /s/<sitename>/ with no login. Files live in data/sites/<user>/<name>/
+  and the index in data/sites.json.
 - v3: Jarvis HUD theme (Orbitron/Rajdhani, glassmorphism, gold + cyan
   glow), drag-and-drop uploads, ZIP project support with safe
   extraction, automatic entry-point detection and requirements.txt
@@ -45,7 +50,9 @@ from datetime import datetime
 from functools import wraps
 
 from flask import (Flask, request, session, redirect, url_for,
-                   render_template_string, abort, jsonify, send_file)
+                   render_template_string, abort, jsonify, send_file,
+                   send_from_directory)
+from werkzeug.exceptions import NotFound
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -59,9 +66,12 @@ LOGS_DIR = os.path.join(DATA_DIR, "logs")
 DB_FILE = os.path.join(DATA_DIR, "bots.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 KEYS_FILE = os.path.join(DATA_DIR, "keys.json")
+SITES_DIR = os.path.join(DATA_DIR, "sites")
+SITES_FILE = os.path.join(DATA_DIR, "sites.json")
 
 os.makedirs(BOTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(SITES_DIR, exist_ok=True)
 
 # --------------------------------------------------------------------------
 # App setup
@@ -331,6 +341,147 @@ def generate_keys(duration_days, quantity):
         save_keys(data)
         return made
 
+
+
+# --------------------------------------------------------------------------
+# Website hosting (static sites, served publicly under /s/<sitename>/)
+# --------------------------------------------------------------------------
+FREE_SITE_LIMIT = 1
+PREMIUM_SITE_LIMIT = 999  # shown to users as "Unlimited"
+_MAX_SITE_UNPACKED = 50 * 1024 * 1024  # 50 MB cap on a site's extracted files
+_SITE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,28}[a-z0-9]")
+
+
+def load_sites():
+    return _load_json(SITES_FILE, {"sites": {}})
+
+
+def save_sites(data):
+    _save_json(SITES_FILE, data)
+
+
+def site_dir(username, sitename):
+    return os.path.join(SITES_DIR, username, sitename)
+
+
+def get_site(sitename):
+    if not sitename:
+        return None
+    return load_sites()["sites"].get(sitename)
+
+
+def user_sites(user_id):
+    rows = [dict(rec, name=name)
+            for name, rec in load_sites()["sites"].items()
+            if rec.get("owner") == user_id]
+    rows.sort(key=lambda r: r.get("created") or 0)
+    return rows
+
+
+def user_site_limit(user):
+    return PREMIUM_SITE_LIMIT if user_is_premium(user) else FREE_SITE_LIMIT
+
+
+def valid_site_name(name):
+    return bool(name) and 3 <= len(name) <= 30 \
+        and _SITE_NAME_RE.fullmatch(name) is not None
+
+
+def _site_stats(path):
+    """(file count, total bytes) of everything stored under a site folder."""
+    files = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            files += 1
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                pass
+    return files, total
+
+
+def _refresh_site_stats(sitename):
+    with _store_lock:
+        data = load_sites()
+        rec = data["sites"].get(sitename)
+        if rec is None:
+            return
+        files, total = _site_stats(site_dir(rec["username"], sitename))
+        rec["files"] = files
+        rec["size"] = total
+        save_sites(data)
+
+
+def _extract_site_zip(zip_path, dest_root):
+    """Safely extract a website ZIP into dest_root.
+
+    Same rules as bot project ZIPs (junk entries skipped, path traversal
+    rejected) with a 50 MB unpacked cap. Raises ValueError on problems.
+    """
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError):
+        raise ValueError("That file is not a valid ZIP archive.")
+    dest_real = os.path.realpath(dest_root)
+    total = 0
+    with zf:
+        for info in zf.infolist():
+            if info.is_dir() or _zip_entry_is_junk(info.filename):
+                continue
+            total += info.file_size
+            if total > _MAX_SITE_UNPACKED:
+                raise ValueError("That ZIP unpacks to more than 50 MB — too big.")
+            target = os.path.realpath(os.path.join(dest_root, info.filename))
+            if target != dest_real and not target.startswith(dest_real + os.sep):
+                raise ValueError("Unsafe path inside ZIP: %s" % info.filename)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+
+
+def _store_site_upload(username, sitename, upload):
+    """Replace a site's files with an uploaded .zip or a single .html.
+
+    A single .html file becomes the site's index.html (its homepage).
+    Returns a user-facing error message, or None on success.
+    """
+    filename = secure_filename(upload.filename or "")
+    lower = filename.lower()
+    dest = site_dir(username, sitename)
+    if lower.endswith(".html"):
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest, exist_ok=True)
+        upload.save(os.path.join(dest, "index.html"))
+        return None
+    if lower.endswith(".zip"):
+        tmp_zip = os.path.join(DATA_DIR,
+                               "site_upload_%s.zip" % secrets.token_hex(4))
+        upload.save(tmp_zip)
+        try:
+            shutil.rmtree(dest, ignore_errors=True)
+            os.makedirs(dest, exist_ok=True)
+            _extract_site_zip(tmp_zip, dest)
+        except ValueError as e:
+            return str(e)
+        finally:
+            try:
+                os.remove(tmp_zip)
+            except OSError:
+                pass
+        return None
+    return "Only .zip or .html files are allowed for websites."
+
+
+def delete_site_everywhere(sitename):
+    with _store_lock:
+        data = load_sites()
+        rec = data["sites"].pop(sitename, None)
+        if rec is not None:
+            save_sites(data)
+    if rec is not None:
+        shutil.rmtree(site_dir(rec["username"], sitename),
+                      ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -871,6 +1022,8 @@ def _maintenance_gate():
     """Maintenance mode: only the admin (and the login page) get through."""
     if request.endpoint == "health":
         return None
+    if request.path.startswith("/s/"):
+        return None  # hosted websites stay public during maintenance
     try:
         if not load_settings().get("maintenance"):
             return None
@@ -1168,6 +1321,8 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
       <p>The whole panel is big, clean and mobile-friendly. Manage bots from anywhere.</p></div>
     <div class="feature"><div class="icon">♾️</div><h3>Scales With You</h3>
       <p>Start free with 2 bots. Redeem a Premium key and host unlimited bots in the same panel.</p></div>
+    <div class="feature"><div class="icon">🌐</div><h3>Website Hosting</h3>
+      <p>Now host static websites too: upload a .zip of your site (or a single .html file) and it goes live at its own link, like your-name under /s/. Free plan includes 1 website — the same Premium key unlocks <b>unlimited bots AND unlimited websites</b>.</p></div>
   </div>
 </div>
 
@@ -1180,6 +1335,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
       <div class="muted">forever</div>
       <ul>
         <li>Up to 2 bots</li>
+        <li>1 hosted website</li>
         <li>Start / stop / restart</li>
         <li>Live logs</li>
         <li>Auto-restart option</li>
@@ -1193,6 +1349,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
       <div class="muted">for 2 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 2 days</li>
+        <li><b>Unlimited</b> websites</li>
         <li>Start / stop / restart</li>
         <li>Live logs</li>
         <li>Auto-restart option</li>
@@ -1205,6 +1362,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
       <div class="muted">for 7 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 7 days</li>
+        <li><b>Unlimited</b> websites</li>
         <li>Start / stop / restart</li>
         <li>Live logs</li>
         <li>Auto-restart option</li>
@@ -1218,6 +1376,7 @@ LANDING_HTML = """<!doctype html><html><head><meta charset="utf-8">
       <div class="muted">for 30 days · with a license key</div>
       <ul>
         <li><b>Unlimited</b> bots for 30 days</li>
+        <li><b>Unlimited</b> websites</li>
         <li>Start / stop / restart</li>
         <li>Live logs</li>
         <li>Auto-restart option</li>
@@ -1322,6 +1481,7 @@ a new key extends your Premium from your current expiry date.</p>
 USER_HEADER = """<header><div class="logo">MR X BOT HOSTING</div>
 <nav>
 <a class="ghost" href="{{ url_for('dashboard') }}">🤖 My Bots</a>
+<a class="ghost" href="{{ url_for('websites') }}">🌐 My Websites</a>
 <a class="ghost" href="{{ url_for('templates_page') }}">🧩 Templates</a>
 <a class="ghost" href="{{ url_for('my_keys') }}">🎟️ My Keys</a>
 <a class="ghost" href="{{ url_for('tickets') }}">🎫 Tickets</a>
@@ -1554,6 +1714,7 @@ ADMIN_NAV = """<header><div class="logo">MR X — ADMIN</div>
 <a class="ghost" href="{{ url_for('admin_tickets') }}">🎫 Tickets</a>
 <a class="ghost" href="{{ url_for('admin_payments') }}">💰 Payments</a>
 <a class="ghost" href="{{ url_for('admin_bots') }}">🤖 All Bots</a>
+<a class="ghost" href="{{ url_for('admin_websites') }}">🌐 Websites</a>
 <a class="ghost" href="{{ url_for('admin_settings') }}">⚙️ Settings</a>
 <a href="{{ url_for('logout') }}">Logout</a>
 </nav></header>"""
@@ -1998,6 +2159,118 @@ it <b style="color:#eee">and redeems any Premium key or promo</b>, you earn
 </div>
 </div></main>
 """ + FOOTER + """</body></html>"""
+
+WEBSITES_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Websites — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + USER_HEADER + """
+<main><div class="wrap">
+<h2 style="font-size:26px">🌐 My Websites ({{ sites|length }} / {{ limit_label }})</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+
+<div class="card">
+<h2>Create a Website</h2>
+<p class="muted" style="margin-top:0">Pick a unique name — your site goes live at
+<b style="color:#eee">/s/your-name/</b>. Names are 3–30 characters: lowercase letters,
+numbers and hyphens only, starting and ending with a letter or number.</p>
+{% if at_limit %}
+<div class="err">{% if plan == 'Premium' %}Website limit reached ({{ limit_label }}).{% else %}Free plan includes <b>1 website</b> — redeem a Premium key for <b>unlimited websites and bots</b>.{% endif %}</div>
+{% endif %}
+<form method="post" action="{{ url_for('create_site') }}">
+  <label>Site name</label>
+  <input type="text" name="sitename" placeholder="e.g. test-shop" maxlength="30"
+         pattern="[a-z0-9][a-z0-9-]{1,28}[a-z0-9]" required>
+  <button type="submit" style="padding:12px 26px" {% if at_limit %}disabled{% endif %}>Create Website</button>
+</form>
+<p class="muted" style="margin-bottom:0">After creating, upload your files below: a <b>.zip</b> of the
+whole site (with index.html inside) or a single <b>.html</b> file, which becomes your homepage.
+Static sites only (HTML / CSS / JS / images) — up to 50 MB per site.</p>
+</div>
+
+<div class="card">
+<h2>My Websites</h2>
+{% if sites %}
+<div class="tablewrap">
+<table>
+<tr><th>Site</th><th>Live URL</th><th>Files</th><th>Size</th><th>Created</th><th>Upload / Replace Files</th><th>Actions</th></tr>
+{% for s in sites %}
+<tr>
+  <td><b>{{ s.name|e }}</b></td>
+  <td><a href="{{ s.url }}" target="_blank" rel="noopener">{{ s.url }}</a></td>
+  <td>{{ s.files }}</td>
+  <td>{{ s.size_label }}</td>
+  <td>{{ s.created_label }}</td>
+  <td>
+    <form method="post" enctype="multipart/form-data"
+          action="{{ url_for('upload_site', sitename=s.name) }}" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="file" name="sitefile" accept=".zip,.html" required style="margin:0">
+      <button class="grey" type="submit">Upload</button>
+    </form>
+  </td>
+  <td>
+    <a class="btn grey" href="{{ s.url }}" target="_blank" rel="noopener">Visit</a>
+    <form class="inline" method="post" action="{{ url_for('delete_site', sitename=s.name) }}"
+          onsubmit="return confirm('Delete this website and all its files?')">
+      <button class="red">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% else %}
+<p class="muted">No websites yet. Create your first one above.</p>
+{% endif %}
+</div>
+
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+ADMIN_SITES_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Websites — MR X Bot Hosting</title>""" + CSS + """</head><body>
+""" + ADMIN_NAV + """
+<main><div class="wrap">
+<h2 style="font-size:26px">🌐 All Websites ({{ sites|length }})</h2>
+{% if flash %}<div class="{{ 'okmsg' if flash.kind == 'ok' else 'err' }}">{{ flash.msg }}</div>{% endif %}
+<div class="card">
+{% if sites %}
+<div class="tablewrap">
+<table>
+<tr><th>Site</th><th>Owner</th><th>Live URL</th><th>Files</th><th>Size</th><th>Created</th><th>Actions</th></tr>
+{% for s in sites %}
+<tr>
+  <td><b>{{ s.name|e }}</b></td>
+  <td>@{{ s.username|e }}</td>
+  <td><a href="{{ s.url }}" target="_blank" rel="noopener">{{ s.url }}</a></td>
+  <td>{{ s.files }}</td>
+  <td>{{ s.size_label }}</td>
+  <td>{{ s.created_label }}</td>
+  <td>
+    <a class="btn grey" href="{{ s.url }}" target="_blank" rel="noopener">Visit</a>
+    <form class="inline" method="post" action="{{ url_for('admin_site_delete', sitename=s.name) }}"
+          onsubmit="return confirm('Delete this website and all its files?')">
+      <button class="red">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% else %}
+<p class="muted">No websites have been created yet.</p>
+{% endif %}
+</div>
+</div></main>
+""" + FOOTER + """</body></html>"""
+
+SITE_MSG_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>""" + CSS + """</head><body>
+<main><div class="wrap center"><div class="card" style="text-align:center">
+<h2>{{ title }}</h2>
+<p class="muted">{{ msg }}</p>
+<p class="muted" style="font-size:13px;margin-bottom:0">Hosted by <b style="color:#d4af37">MR X BOT HOSTING</b></p>
+</div></div></main>
+</body></html>"""
 
 ADMIN_SETTINGS_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2546,6 +2819,8 @@ def profile_delete():
         return redirect(url_for("profile"))
     for bot in list(user_bots(user["id"])):
         delete_bot_everywhere(bot["id"])
+    for site in list(user_sites(user["id"])):
+        delete_site_everywhere(site["name"])
     with _store_lock:
         data = load_users()
         data["users"] = [u for u in data["users"] if u["id"] != user["id"]]
@@ -2574,6 +2849,135 @@ def my_keys():
         MYKEYS_HTML, keys=rows, flash=pop_flash(),
         ref_link=ref["link"], ref_count=ref["joined"],
         ref_credited=ref["credited"], ref_days=ref["days"])
+
+
+# --------------------------------------------------------------------------
+# Routes — website hosting (public serving + user management)
+# --------------------------------------------------------------------------
+@app.route("/s/<sitename>")
+def site_no_slash(sitename):
+    """No trailing slash: redirect so the site's relative links work."""
+    return redirect("/s/%s/" % sitename, code=301)
+
+
+@app.route("/s/<sitename>/", defaults={"rest": ""})
+@app.route("/s/<sitename>/<path:rest>")
+def serve_site(sitename, rest):
+    """Serve a hosted static website. Public — no login required."""
+    rec = get_site(sitename)
+    if rec is None:
+        return render_template_string(
+            SITE_MSG_HTML, title="Site Not Found",
+            msg="There is no website at this address."), 404
+    root = site_dir(rec["username"], sitename)
+    if not os.path.isdir(root):
+        return render_template_string(
+            SITE_MSG_HTML, title="Site Not Found",
+            msg="There is no website at this address."), 404
+    rel = rest or ""
+    if rel == "" or rel.endswith("/"):
+        rel += "index.html"
+    try:
+        return send_from_directory(root, rel)
+    except NotFound:
+        if os.path.basename(rel) == "index.html":
+            return render_template_string(
+                SITE_MSG_HTML, title="No Homepage Yet",
+                msg="This website has no index.html yet — the owner has "
+                    "not uploaded one."), 404
+        return render_template_string(
+            SITE_MSG_HTML, title="Page Not Found",
+            msg="That page was not found on this website."), 404
+
+
+@app.route("/websites")
+@user_required
+def websites():
+    user = current_user()
+    rows = []
+    for rec in user_sites(user["id"]):
+        r = dict(rec)
+        r["url"] = "/s/%s/" % r["name"]
+        r["size_label"] = fmt_size(r.get("size") or 0)
+        r["created_label"] = fmt_date(r.get("created"))
+        rows.append(r)
+    limit = user_site_limit(user)
+    premium = user_is_premium(user)
+    return render_template_string(
+        WEBSITES_HTML, user=user, sites=rows, plan=user_plan_name(user),
+        limit=limit, limit_label="Unlimited" if premium else str(limit),
+        at_limit=len(rows) >= limit, flash=pop_flash())
+
+
+@app.route("/websites/create", methods=["POST"])
+@user_required
+def create_site():
+    user = current_user()
+    name = (request.form.get("sitename") or "").strip().lower()
+    if not valid_site_name(name):
+        flash("Site name must be 3–30 characters: lowercase letters, numbers "
+              "and hyphens only, starting and ending with a letter or "
+              "number.", "err")
+        return redirect(url_for("websites"))
+    with _store_lock:
+        data = load_sites()
+        if name in data["sites"]:
+            flash("That site name is already taken. Pick another one.", "err")
+            return redirect(url_for("websites"))
+        mine = [r for r in data["sites"].values()
+                if r.get("owner") == user["id"]]
+        limit = user_site_limit(user)
+        if len(mine) >= limit:
+            if user_is_premium(user):
+                flash("Website limit reached (%d)." % limit, "err")
+            else:
+                flash("Free plan includes 1 website — redeem a Premium key "
+                      "for unlimited websites (and unlimited bots).", "err")
+            return redirect(url_for("websites"))
+        os.makedirs(site_dir(user["username"], name), exist_ok=True)
+        data["sites"][name] = {
+            "owner": user["id"],
+            "username": user["username"],
+            "created": int(time.time()),
+            "size": 0,
+            "files": 0,
+        }
+        save_sites(data)
+    flash("Website '%s' created — now upload your files below (a .zip of "
+          "the site, or a single .html)." % name)
+    return redirect(url_for("websites"))
+
+
+@app.route("/websites/<sitename>/upload", methods=["POST"])
+@user_required
+def upload_site(sitename):
+    user = current_user()
+    rec = get_site(sitename)
+    if rec is None or rec.get("owner") != user["id"]:
+        abort(404)
+    upload = request.files.get("sitefile")
+    if upload is None or not upload.filename:
+        flash("Choose a .zip or .html file to upload.", "err")
+        return redirect(url_for("websites"))
+    error = _store_site_upload(user["username"], sitename, upload)
+    if error:
+        flash(error, "err")
+        return redirect(url_for("websites"))
+    _refresh_site_stats(sitename)
+    flash("Files for '%s' updated — your website is live." % sitename)
+    return redirect(url_for("websites"))
+
+
+@app.route("/websites/<sitename>/delete", methods=["POST"])
+@user_required
+def delete_site(sitename):
+    user = current_user()
+    rec = get_site(sitename)
+    if rec is None or rec.get("owner") != user["id"]:
+        abort(404)
+    delete_site_everywhere(sitename)
+    flash("Website '%s' deleted." % sitename)
+    return redirect(url_for("websites"))
 
 
 def _bot_or_404(bot_id):
@@ -2947,11 +3351,14 @@ def admin_user_delete(user_id):
         abort(404)
     for bot in list(user_bots(user_id)):
         delete_bot_everywhere(bot["id"])
+    for site in list(user_sites(user_id)):
+        delete_site_everywhere(site["name"])
     with _store_lock:
         data = load_users()
         data["users"] = [u for u in data["users"] if u["id"] != user_id]
         save_users(data)
-    flash("User @%s and all their bots were deleted." % user["username"])
+    flash("User @%s and all their bots and websites were deleted."
+          % user["username"])
     return redirect(url_for("admin_users"))
 
 
@@ -3042,6 +3449,34 @@ def admin_bots():
     return render_template_string(ADMIN_BOTS_HTML, bots=bots, q=q,
                                   flash=pop_flash())
 
+
+
+# --------------------------------------------------------------------------
+# Routes — admin website hosting
+# --------------------------------------------------------------------------
+@app.route("/admin/websites")
+@admin_required
+def admin_websites():
+    rows = []
+    for name, rec in sorted(load_sites()["sites"].items()):
+        r = dict(rec)
+        r["name"] = name
+        r["url"] = "/s/%s/" % name
+        r["size_label"] = fmt_size(r.get("size") or 0)
+        r["created_label"] = fmt_datetime(r.get("created"))
+        rows.append(r)
+    return render_template_string(ADMIN_SITES_HTML, sites=rows,
+                                  flash=pop_flash())
+
+
+@app.route("/admin/websites/<sitename>/delete", methods=["POST"])
+@admin_required
+def admin_site_delete(sitename):
+    if get_site(sitename) is None:
+        abort(404)
+    delete_site_everywhere(sitename)
+    flash("Website '%s' deleted." % sitename)
+    return redirect(url_for("admin_websites"))
 
 
 # --------------------------------------------------------------------------
